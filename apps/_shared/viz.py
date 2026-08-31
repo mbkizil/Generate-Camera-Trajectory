@@ -11,7 +11,7 @@ the way the reference LAMP codebase did in several inconsistent places.
 from __future__ import annotations
 
 import numpy as np
-import viser
+import camtraj_viser as viser
 from scipy.spatial.transform import Rotation
 
 from camtraj.conventions import OPENGL, OPENCV, convert_pose
@@ -39,8 +39,8 @@ DEFAULT_CAMERA_START = np.array([0.0, 1.0, 5.0])  # 1m above ground, 5m from the
 
 
 def add_ground(server: viser.ViserServer, size: float = 20.0) -> None:
-    """A solid-looking ground plane (not just floating grid lines) plus a
-    reference cube, so trajectories read against a real sense of scale."""
+    """A solid-looking ground plane (not just floating grid lines), so
+    trajectories read against a real sense of scale."""
     server.scene.add_grid(
         "/ground",
         width=size,
@@ -54,12 +54,21 @@ def add_ground(server: viser.ViserServer, size: float = 20.0) -> None:
         plane_opacity=0.5,
         shadow_opacity=0.35,
     )
-    server.scene.add_box(
+
+
+def add_reference_box(server: viser.ViserServer):
+    """The scene's anchor object ("the box") -- may move over time, hence a
+    handle is returned so its position can be updated during scrub/playback."""
+    return server.scene.add_box(
         "/reference_cube",
         color=(210, 140, 60),
         dimensions=(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
         position=CUBE_CENTER,
     )
+
+
+def update_reference_box(handle, position: np.ndarray) -> None:
+    handle.position = position
 
 
 def add_path(server: viser.ViserServer, name: str, trajectory: Trajectory, color=(80, 170, 255)):

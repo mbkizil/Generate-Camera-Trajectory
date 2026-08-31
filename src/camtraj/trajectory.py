@@ -31,6 +31,9 @@ class Trajectory:
         times: (N,) float64 seconds, non-decreasing, starts at 0 by convention.
         positions: (N, 3) float64 world-space camera centers.
         rotations: batched `Rotation` of length N, camera-to-world orientation.
+        box_positions: (N, 3) float64 world-space position of the scene's anchor
+            object ("the box") at each frame, or None if not tracked (only
+            `sequence()` populates this; a lone segment's `.build()` doesn't).
         fps: informational nominal sample rate, if the trajectory was built at one.
         metadata: free-form provenance (which segment(s)/recipe/seed produced this).
     """
@@ -38,6 +41,7 @@ class Trajectory:
     times: np.ndarray
     positions: np.ndarray
     rotations: Rotation
+    box_positions: np.ndarray | None = None
     fps: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -51,6 +55,10 @@ class Trajectory:
             raise ValueError(f"rotations must have length {n}, got {_rotation_len(self.rotations)}")
         if n > 1 and np.any(np.diff(self.times) < 0):
             raise ValueError("times must be non-decreasing")
+        if self.box_positions is not None:
+            self.box_positions = np.asarray(self.box_positions, dtype=np.float64)
+            if self.box_positions.shape != (n, 3):
+                raise ValueError(f"box_positions must have shape ({n}, 3), got {self.box_positions.shape}")
 
     def __len__(self) -> int:
         return len(self.times)
@@ -79,6 +87,13 @@ class Trajectory:
         rot = Slerp(self.times, self.rotations)(t)
         return pos, rot
 
+    def box_position_at(self, t) -> np.ndarray:
+        """Interpolate the anchor object's ("the box") position at time(s) `t`."""
+        if self.box_positions is None:
+            raise ValueError("This Trajectory has no box_positions; build it via sequence(..., box_motions=...)")
+        t = np.clip(np.asarray(t, dtype=np.float64), self.times[0], self.times[-1])
+        return np.stack([np.interp(t, self.times, self.box_positions[:, i]) for i in range(3)], axis=-1)
+
     def resample(self, *, times=None, n_frames: int | None = None, fps: float | None = None) -> "Trajectory":
         """Resample to new timestamps, decoupling motion *shape* from *sample rate*."""
         if times is None:
@@ -91,10 +106,12 @@ class Trajectory:
                 raise ValueError("resample() requires one of times, n_frames, fps")
         times = np.asarray(times, dtype=np.float64)
         positions, rotations = self.pose_at(times)
+        box_positions = self.box_position_at(times) if self.box_positions is not None else None
         return Trajectory(
             times=times,
             positions=positions,
             rotations=rotations,
+            box_positions=box_positions,
             fps=fps if fps is not None else self.fps,
             metadata=dict(self.metadata),
         )

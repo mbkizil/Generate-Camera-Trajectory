@@ -1,0 +1,680 @@
+import { Instance, Instances, shaderMaterial } from "@react-three/drei";
+import { useFrame, useThree } from "@react-three/fiber";
+import { OutlinesIfHovered } from "./OutlinesIfHovered";
+import React from "react";
+import * as THREE from "three";
+import { useAsyncTexture } from "./utils/useAsyncTexture";
+import {
+  ImageMessage,
+  LabelMessage,
+  PointCloudMessage,
+} from "./WebsocketMessages";
+import { BatchedMeshHoverOutlines } from "./mesh/BatchedMeshHoverOutlines";
+import { MeshBasicMaterial } from "three";
+import { normalizeScale } from "./utils/normalizeScale";
+import { syncPointCloudGeometry } from "./utils/pointCloudGeometry";
+// @ts-ignore - troika-three-text doesn't have type definitions
+import { Text as TroikaText } from "troika-three-text";
+import { BatchedLabelManagerContext } from "./BatchedLabelManagerContext";
+import { ViewerContext } from "./ViewerContext";
+import { calculateBaseFontSize, LABEL_FONT } from "./LabelUtils";
+
+const originGeom = new THREE.SphereGeometry(1.0);
+
+const PointCloudMaterial = /* @__PURE__ */ shaderMaterial(
+  {
+    scale: 1.0,
+    point_ball_norm: 0.0,
+    point_shading_enabled: 0.0,
+    uniformColor: new THREE.Color(1, 1, 1),
+    fogColor: new THREE.Color(1, 1, 1),
+    fogNear: 0.0,
+    fogFar: 1000.0,
+  },
+  `
+  precision mediump float;
+
+  varying vec3 vPosition;
+  varying vec3 vColor; // in the vertex shader
+  varying vec3 vInnerSqCol;
+  varying vec3 vOuterSqCol;
+  uniform float scale;
+  uniform vec3 uniformColor;
+  // Explicit precision qualifier required: must match the fragment shader
+  // declaration for Firefox to link the program.
+  uniform mediump float point_shading_enabled;
+
+  #include <fog_pars_vertex>
+
+  void main() {
+      vPosition = position;
+      #ifdef USE_COLOR
+      vColor = color;
+      #else
+      vColor = uniformColor;
+      #endif
+      // Pre-compute per-vertex shading bounds (constant across all fragments of a point).
+      vec3 sq_col = vColor * vColor;
+      vInnerSqCol = max(sq_col - 0.02, 0.0);
+      vOuterSqCol = min(sq_col + 0.01, 1.0);
+      vec4 world_pos = modelViewMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * world_pos;
+      gl_PointSize = (scale / -world_pos.z);
+      #ifdef USE_FOG
+        vFogDepth = -world_pos.z;
+      #endif
+  }
+   `,
+  `varying vec3 vPosition;
+  varying vec3 vColor;
+  varying vec3 vInnerSqCol;
+  varying vec3 vOuterSqCol;
+  uniform float point_ball_norm;
+  uniform mediump float point_shading_enabled;
+
+  #include <fog_pars_fragment>
+
+  void main() {
+      if (point_ball_norm < 1000.0) {
+          float r = pow(
+              pow(abs(gl_PointCoord.x - 0.5), point_ball_norm)
+              + pow(abs(gl_PointCoord.y - 0.5), point_ball_norm),
+              1.0 / point_ball_norm);
+          if (r > 0.5) discard;
+      }
+      vec3 col = vColor;
+      if (point_shading_enabled > 0.5) {
+          // Interpolation in approximate linear space (gamma 2.0) for
+          // perceptually smoother gradients.
+          // t: 0 at center, 1 at edge.
+          float t = min(length(gl_PointCoord - vec2(0.5)), 0.5) * 2.0;
+          col = sqrt(t * vInnerSqCol + (1.0 - t) * vOuterSqCol);
+      }
+      gl_FragColor = vec4(col, 1.0);
+      #include <fog_fragment>
+  }
+   `,
+);
+
+export const PointCloud = React.forwardRef<
+  THREE.Group,
+  PointCloudMessage & { children?: React.ReactNode }
+>(function PointCloud({ children, ...message }, ref) {
+  const getThreeState = useThree((state) => state.get);
+
+  const props = message.props;
+
+  // Geometry populated via ref -- R3F auto-disposes on unmount.
+  const geomRef = React.useRef<THREE.BufferGeometry>(null);
+  React.useLayoutEffect(() => {
+    const geom = geomRef.current;
+    if (!geom) return;
+    // Reuse the existing GPU buffers in place across updates. Replacing
+    // attributes with `setAttribute(new ...)` every update leaks the old buffer;
+    // a same-size swap reuses it; a point-count change reallocates safely. See
+    // syncPointCloudGeometry / syncBufferGeometry.
+    syncPointCloudGeometry(geom, props.points, props.colors);
+  }, [props.points, props.colors]);
+
+  // Material needs heavy per-frame uniform updates, so kept imperative.
+  const material = React.useMemo(() => {
+    const material = new PointCloudMaterial();
+    material.fog = true;
+
+    if (props.colors.length > 3) {
+      material.vertexColors = true;
+    } else {
+      material.vertexColors = false;
+      material.uniforms.uniformColor.value = new THREE.Color(
+        props.colors[0] / 255.0,
+        props.colors[1] / 255.0,
+        props.colors[2] / 255.0,
+      );
+    }
+
+    return material;
+  }, [props.colors]);
+
+  React.useEffect(() => {
+    return () => material.dispose();
+  }, [material]);
+
+  // Reused by the point-size useFrame below.
+  const rendererSizeRef = React.useRef(new THREE.Vector2());
+  const lastScaleInputsRef = React.useRef({
+    fov: -1,
+    height: -1,
+    pixelRatio: -1,
+    pointSize: -1,
+    scaleFactor: -1,
+  });
+
+  // Update material properties with point_ball_norm.
+  React.useEffect(() => {
+    material.uniforms.scale.value = 10.0;
+    material.uniforms.point_ball_norm.value = {
+      square: Infinity,
+      diamond: 1.0,
+      circle: 2.0,
+      rounded: 3.0,
+      sparkle: 0.6,
+    }[props.point_shape];
+    material.uniforms.point_shading_enabled.value =
+      props.point_shading === "gradient" ? 1.0 : 0.0;
+    // The scale uniform was just reset to a placeholder (and `material` may be
+    // freshly recreated); invalidate the cache so the useFrame below recomputes
+    // the real scale on the next frame.
+    lastScaleInputsRef.current.fov = NaN;
+  }, [props.point_shape, props.point_shading, material]);
+
+  // Compute a scalar scale factor for point size. For non-uniform scale,
+  // use geometric mean since points are rendered as circles.
+  const s = normalizeScale(props.scale);
+  const pointScaleFactor = Math.cbrt(s[0] * s[1] * s[2]);
+
+  // Recompute the point-size uniform only when one of its inputs (fov, viewport
+  // height, pixel ratio, point_size x scale) actually changes; this runs every
+  // frame for every point cloud in the scene.
+  useFrame(() => {
+    const three = getThreeState();
+    const fov = (three.camera as THREE.PerspectiveCamera).fov;
+    const height = three.gl.getSize(rendererSizeRef.current).height;
+    const pixelRatio = three.gl.getPixelRatio();
+    const last = lastScaleInputsRef.current;
+    if (
+      fov === last.fov &&
+      height === last.height &&
+      pixelRatio === last.pixelRatio &&
+      props.point_size === last.pointSize &&
+      pointScaleFactor === last.scaleFactor
+    ) {
+      return;
+    }
+    last.fov = fov;
+    last.height = height;
+    last.pixelRatio = pixelRatio;
+    last.pointSize = props.point_size;
+    last.scaleFactor = pointScaleFactor;
+
+    // Match point scale to behavior of THREE.PointsMaterial().
+    // point px height / actual height = point meters height / frustum meters height
+    // frustum meters height = math.tan(fov / 2.0) * z
+    // point px height = (point meters height / math.tan(fov / 2.0) * actual height)  / z
+    material.uniforms.scale.value =
+      ((props.point_size * pointScaleFactor) /
+        Math.tan(((fov / 180.0) * Math.PI) / 2.0)) *
+      height *
+      pixelRatio;
+  });
+  return (
+    <group ref={ref}>
+      <group scale={normalizeScale(message.props.scale)}>
+        <points frustumCulled={false} material={material}>
+          <bufferGeometry ref={geomRef} />
+        </points>
+      </group>
+      {children}
+    </group>
+  );
+});
+
+/** Helper for adding coordinate frames as scene nodes. */
+export const CoordinateFrame = React.forwardRef<
+  THREE.Group,
+  {
+    showAxes?: boolean;
+    axesLength?: number;
+    axesRadius?: number;
+    originRadius?: number;
+    originColor?: number;
+    scale?: number | [number, number, number];
+    children?: React.ReactNode;
+  }
+>(function CoordinateFrame(
+  {
+    showAxes = true,
+    axesLength = 0.5,
+    axesRadius = 0.0125,
+    originRadius = undefined,
+    scale = 1.0,
+    originColor = 0xecec00,
+    children,
+  },
+  ref,
+) {
+  originRadius = originRadius ?? axesRadius * 2;
+  return (
+    <group ref={ref}>
+      <group scale={normalizeScale(scale)}>
+        {showAxes && (
+          <>
+            <mesh
+              geometry={originGeom}
+              scale={
+                new THREE.Vector3(originRadius, originRadius, originRadius)
+              }
+            >
+              <meshBasicMaterial color={originColor} />
+              <OutlinesIfHovered />
+            </mesh>
+            <Instances limit={6}>
+              <meshBasicMaterial />
+              <cylinderGeometry
+                args={[axesRadius, axesRadius, axesLength, 16]}
+              />
+              <Instance
+                rotation={new THREE.Euler(0.0, 0.0, (3.0 * Math.PI) / 2.0)}
+                position={[0.5 * axesLength, 0.0, 0.0]}
+                color={0xcc0000}
+              >
+                {/* unmountOnHide is needed to use OutlineIfHovered within <Instances />. */}
+                <OutlinesIfHovered unmountOnHide enableCreaseAngle />
+              </Instance>
+              <Instance
+                position={[0.0, 0.5 * axesLength, 0.0]}
+                color={0x00cc00}
+              >
+                <OutlinesIfHovered unmountOnHide enableCreaseAngle />
+              </Instance>
+              <Instance
+                rotation={new THREE.Euler(Math.PI / 2.0, 0.0, 0.0)}
+                position={[0.0, 0.0, 0.5 * axesLength]}
+                color={0x0000cc}
+              >
+                <OutlinesIfHovered unmountOnHide enableCreaseAngle />
+              </Instance>
+            </Instances>
+          </>
+        )}
+      </group>
+      {children}
+    </group>
+  );
+});
+
+/** Helper for adding batched/instanced coordinate frames as scene nodes. */
+export const InstancedAxes = React.forwardRef<
+  THREE.Group,
+  {
+    /** Float32 quaternion values (wxyz) */
+    batched_wxyzs: Float32Array;
+    /** Float32 position values (xyz) */
+    batched_positions: Float32Array;
+    /** Float32 scale values (uniform or per-axis XYZ) */
+    batched_scales: Float32Array | null;
+    axes_length?: number;
+    axes_radius?: number;
+    scale?: number | [number, number, number];
+    children?: React.ReactNode;
+  }
+>(function InstancedAxes(
+  {
+    batched_wxyzs,
+    batched_positions,
+    batched_scales,
+    axes_length = 0.5,
+    axes_radius = 0.0125,
+    scale = 1.0,
+    children,
+  },
+  ref,
+) {
+  const axesRef = React.useRef<THREE.InstancedMesh>(null);
+
+  // Create geometry and material using useMemo.
+  const cylinderGeom = React.useMemo(
+    () => new THREE.CylinderGeometry(axes_radius, axes_radius, axes_length, 16),
+    [axes_radius, axes_length],
+  );
+
+  const material = React.useMemo(() => new MeshBasicMaterial(), []);
+
+  // Dispose resources when component unmounts.
+  React.useEffect(() => {
+    return () => {
+      cylinderGeom.dispose();
+      material.dispose();
+    };
+  }, [cylinderGeom, material]);
+
+  // Pre-compute transformation matrices for axes using useMemo.
+  const axesTransformations = React.useMemo(() => {
+    return {
+      T_frame_framex: new THREE.Matrix4()
+        .makeRotationFromEuler(new THREE.Euler(0.0, 0.0, (3.0 * Math.PI) / 2.0))
+        .setPosition(0.5 * axes_length, 0.0, 0.0),
+      T_frame_framey: new THREE.Matrix4()
+        .makeRotationFromEuler(new THREE.Euler(0.0, 0.0, 0.0))
+        .setPosition(0.0, 0.5 * axes_length, 0.0),
+      T_frame_framez: new THREE.Matrix4()
+        .makeRotationFromEuler(new THREE.Euler(Math.PI / 2.0, 0.0, 0.0))
+        .setPosition(0.0, 0.0, 0.5 * axes_length),
+      red: new THREE.Color(0xcc0000),
+      green: new THREE.Color(0x00cc00),
+      blue: new THREE.Color(0x0000cc),
+    };
+  }, [axes_length]);
+
+  // Update instance matrices and colors.
+  React.useEffect(() => {
+    if (!axesRef.current) return;
+
+    // Pre-allocate to avoid garbage collector from running during loop.
+    const T_world_frame = new THREE.Matrix4();
+    const T_world_framex = new THREE.Matrix4();
+    const T_world_framey = new THREE.Matrix4();
+    const T_world_framez = new THREE.Matrix4();
+    const tmpQuat = new THREE.Quaternion();
+    const tmpScale = new THREE.Vector3();
+
+    const { T_frame_framex, T_frame_framey, T_frame_framez, red, green, blue } =
+      axesTransformations;
+
+    // Calculate number of instances.
+    const numInstances = batched_wxyzs.length / 4;
+
+    // Determine scaling mode.
+    const perAxisScaling =
+      batched_scales !== null &&
+      batched_scales.length === (batched_wxyzs.length / 4) * 3;
+
+    for (let i = 0; i < numInstances; i++) {
+      // Use modulo as a defensive check to prevent out-of-bounds reads when
+      // array lengths don't match.
+      const posIdx = (i * 3) % batched_positions.length;
+      const wxyzIdx = (i * 4) % batched_wxyzs.length;
+
+      // Read scale value if available.
+      if (batched_scales !== null) {
+        if (perAxisScaling) {
+          const scaleIdx = (i * 3) % batched_scales.length;
+          tmpScale.set(
+            batched_scales[scaleIdx], // x scale
+            batched_scales[scaleIdx + 1], // y scale
+            batched_scales[scaleIdx + 2], // z scale
+          );
+        } else {
+          const scale = batched_scales[i % batched_scales.length];
+          tmpScale.set(scale, scale, scale);
+        }
+      } else {
+        tmpScale.set(1, 1, 1);
+      }
+
+      // Set transform from Float32Array values directly.
+      T_world_frame.makeRotationFromQuaternion(
+        tmpQuat.set(
+          batched_wxyzs[wxyzIdx + 1], // x
+          batched_wxyzs[wxyzIdx + 2], // y
+          batched_wxyzs[wxyzIdx + 3], // z
+          batched_wxyzs[wxyzIdx], // w (first value)
+        ),
+      )
+        .scale(tmpScale)
+        .setPosition(
+          batched_positions[posIdx], // x
+          batched_positions[posIdx + 1], // y
+          batched_positions[posIdx + 2], // z
+        );
+
+      T_world_framex.copy(T_world_frame).multiply(T_frame_framex);
+      T_world_framey.copy(T_world_frame).multiply(T_frame_framey);
+      T_world_framez.copy(T_world_frame).multiply(T_frame_framez);
+
+      axesRef.current.setMatrixAt(i * 3 + 0, T_world_framex);
+      axesRef.current.setMatrixAt(i * 3 + 1, T_world_framey);
+      axesRef.current.setMatrixAt(i * 3 + 2, T_world_framez);
+
+      axesRef.current.setColorAt(i * 3 + 0, red);
+      axesRef.current.setColorAt(i * 3 + 1, green);
+      axesRef.current.setColorAt(i * 3 + 2, blue);
+    }
+    axesRef.current.instanceMatrix.needsUpdate = true;
+    // `instanceColor` stays null until the first setColorAt, so it's null when
+    // there are zero instances -- guard the deref.
+    if (axesRef.current.instanceColor !== null)
+      axesRef.current.instanceColor.needsUpdate = true;
+    // Invalidate the cached bounding sphere so raycasting (clicks/hover) tests
+    // against the new instance positions rather than the stale ones.
+    axesRef.current.boundingSphere = null;
+  }, [batched_wxyzs, batched_positions, batched_scales, axesTransformations]);
+
+  // Create cylinder geometries for outlines - one for each axis.
+  const outlineCylinderGeom = React.useMemo(
+    () => new THREE.CylinderGeometry(axes_radius, axes_radius, axes_length, 16),
+    [axes_radius, axes_length],
+  );
+  // Dispose the outline geometry when it's replaced (axis dimensions change) or
+  // on unmount. It's consumed by BatchedMeshHoverOutlines, which clones it, so
+  // this original is ours to free.
+  React.useEffect(
+    () => () => outlineCylinderGeom.dispose(),
+    [outlineCylinderGeom],
+  );
+
+  // Compute transform matrices for each axis (x, y, z).
+  const axisTransforms = React.useMemo(
+    () => [
+      {
+        position: new THREE.Vector3(0.5 * axes_length, 0, 0),
+        rotation: new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(0, 0, (3 * Math.PI) / 2),
+        ),
+        scale: new THREE.Vector3(1, 1, 1),
+      },
+      {
+        position: new THREE.Vector3(0, 0.5 * axes_length, 0),
+        rotation: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, 0)),
+        scale: new THREE.Vector3(1, 1, 1),
+      },
+      {
+        position: new THREE.Vector3(0, 0, 0.5 * axes_length),
+        rotation: new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(Math.PI / 2, 0, 0),
+        ),
+        scale: new THREE.Vector3(1, 1, 1),
+      },
+    ],
+    [axes_length],
+  );
+
+  // Calculate number of instances for args.
+  const numInstances = (batched_wxyzs.byteLength / (4 * 4)) * 3; // 4 floats per WXYZ * 4 bytes per float * 3 axes
+
+  return (
+    <group ref={ref}>
+      <group scale={normalizeScale(scale)}>
+        <instancedMesh
+          ref={axesRef}
+          args={[cylinderGeom, material, numInstances]}
+          // Instance matrices are updated imperatively, so the cached bounding
+          // sphere used for frustum culling goes stale; disable culling so the
+          // axes don't pop out of view after a position update.
+          frustumCulled={false}
+        />
+
+        {/* Create hover outlines for each axis (x, y, z). */}
+        {axisTransforms.map((meshTransform, i) => (
+          <BatchedMeshHoverOutlines
+            key={i}
+            geometry={outlineCylinderGeom}
+            batched_positions={batched_positions}
+            batched_wxyzs={batched_wxyzs}
+            batched_scales={batched_scales}
+            meshTransform={meshTransform}
+            computeBatchIndexFromInstanceIndex={(instanceId) =>
+              Math.floor(instanceId / 3)
+            }
+          />
+        ))}
+      </group>
+      {children}
+    </group>
+  );
+});
+
+export const ViserImage = React.forwardRef<
+  THREE.Group,
+  ImageMessage & { children?: React.ReactNode }
+>(function ViserImage({ children, ...message }, ref) {
+  const imageTexture = useAsyncTexture(
+    message.props._format,
+    message.props._data,
+  );
+  return (
+    <group ref={ref}>
+      <group scale={normalizeScale(message.props.scale)}>
+        <mesh
+          rotation={new THREE.Euler(Math.PI, 0.0, 0.0)}
+          castShadow={message.props.cast_shadow}
+          receiveShadow={message.props.receive_shadow === true}
+        >
+          <OutlinesIfHovered />
+          <planeGeometry
+            attach="geometry"
+            args={[message.props.render_width, message.props.render_height]}
+          />
+          <meshBasicMaterial
+            attach="material"
+            transparent={true}
+            side={THREE.DoubleSide}
+            map={imageTexture}
+            toneMapped={false}
+          />
+        </mesh>
+      </group>
+      {children}
+    </group>
+  );
+});
+
+/**
+ * Convert label anchor to Troika anchorX and anchorY values.
+ */
+function labelAnchorToTroikaAnchors(anchor: string): {
+  anchorX: "left" | "center" | "right";
+  anchorY: "top" | "middle" | "bottom";
+} {
+  const [vertical, horizontal] = anchor.split("-");
+  const anchorY =
+    vertical === "top" ? "top" : vertical === "bottom" ? "bottom" : "middle";
+  const anchorX =
+    horizontal === "left"
+      ? "left"
+      : horizontal === "right"
+        ? "right"
+        : "center";
+  return { anchorX, anchorY };
+}
+
+export const ViserLabel = React.forwardRef<
+  THREE.Group,
+  LabelMessage & { children?: React.ReactNode }
+>(function ViserLabel({ children, ...message }, ref) {
+  const viewer = React.useContext(ViewerContext)!;
+  const groupRef = React.useRef<THREE.Group>(null!);
+  const textRef = React.useRef<TroikaText>(null!);
+
+  const manager = React.useContext(BatchedLabelManagerContext);
+  if (!manager) {
+    throw new Error(
+      "ViserLabel must be used within BatchedLabelManager context",
+    );
+  }
+
+  // Convert anchor to Troika format.
+  const { anchorX, anchorY } = labelAnchorToTroikaAnchors(message.props.anchor);
+
+  // Calculate base font size (used for initial setup).
+  const baseFontSize = calculateBaseFontSize(
+    message.props.font_size_mode,
+    message.props.font_screen_scale,
+    message.props.font_scene_height,
+  );
+
+  // Create text once on mount and register with global manager.
+  React.useEffect(() => {
+    const text = new TroikaText();
+    text.text = message.props.text;
+    text.font = LABEL_FONT;
+    text.fontSize = baseFontSize;
+    text.color = 0x000000; // Black.
+    text.anchorX = anchorX;
+    text.anchorY = anchorY;
+
+    // Lower SDF resolution for better performance with many labels.
+    // Default is 64, lower values = lower quality but faster rendering.
+    text.sdfGlyphSize = 32;
+
+    // Position is always (0, 0, 0) in local space - parent transform handles wxyz/position.
+    text.position.set(0, 0, 0);
+
+    // Don't sync here - registerText will sync the BatchedText after adding.
+    textRef.current = text;
+    // Register with global manager, passing font parameters and anchor info.
+    manager.registerText(
+      text,
+      message.name,
+      message.props.depth_test,
+      message.props.font_size_mode,
+      message.props.font_screen_scale,
+      message.props.font_scene_height,
+      anchorX,
+      anchorY,
+    );
+
+    return () => {
+      manager.unregisterText(text);
+      text.dispose();
+    };
+  }, []);
+
+  // Update text content when it changes.
+  React.useEffect(() => {
+    if (textRef.current) {
+      textRef.current.text = message.props.text;
+      // Don't call text.sync() - let the BatchedText handle it via manager.syncText().
+      manager.syncText(textRef.current);
+    }
+  }, [message.props.text, manager]);
+
+  // Update text properties when they change.
+  // Use updateText() which is much more efficient than unregister/register.
+  React.useEffect(() => {
+    if (textRef.current) {
+      manager.updateText(
+        textRef.current,
+        message.props.depth_test,
+        message.props.font_size_mode,
+        message.props.font_screen_scale,
+        message.props.font_scene_height,
+        anchorX,
+        anchorY,
+      );
+    }
+  }, [
+    message.props.depth_test,
+    message.props.font_size_mode,
+    message.props.font_screen_scale,
+    message.props.font_scene_height,
+    anchorX,
+    anchorY,
+    manager,
+  ]);
+
+  // BatchedLabelManager handles position updates, visibility, and culling.
+  React.useImperativeHandle(ref, () => groupRef.current, []);
+
+  // Use a selector to subscribe only to this node's children.
+  const hasChildren = viewer.useSceneTree(message.name, (node) => {
+    return node?.children && node.children.length > 0;
+  });
+
+  // Return null when no children - BatchedTextManager handles the text rendering.
+  // Return group when there are children - SceneTree needs it to apply transforms to child nodes.
+  if (!hasChildren) {
+    return null;
+  } else {
+    return <group ref={groupRef}>{children}</group>;
+  }
+});

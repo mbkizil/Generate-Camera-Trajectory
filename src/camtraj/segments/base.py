@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -21,6 +22,12 @@ from scipy.spatial.transform import Rotation
 from ..trajectory import Trajectory
 
 _META_KEY = "camtraj_param"
+_ENUM_META_KEY = "camtraj_enum_param"
+_GROUP_META_KEY = "camtraj_optional_group"
+
+DUTCH_MARKS = {v: str(int(v)) for v in (-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0)}
+"""Shared reference marks for a dutch/roll angle -- a "common modifier" in the
+original DSL, reused by every target-relative primitive (orbit, tail, ...)."""
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,65 @@ def get_param_specs(segment) -> list[ParamSpec]:
     return specs
 
 
+@dataclass(frozen=True)
+class EnumParamSpec:
+    """UI-facing description of one segment dropdown (categorical) parameter."""
+
+    name: str
+    label: str
+    enum_cls: type[Enum]
+    default: Enum
+
+
+def enum_param(*, label: str, enum_cls: type[Enum], default: Enum) -> dataclasses.Field:
+    """Dataclass field wrapper attaching an `EnumParamSpec` -- the dropdown
+    equivalent of `param()`, kept as metadata (not a type-annotation lookup)
+    since `from __future__ import annotations` makes annotations plain strings
+    at runtime."""
+    spec = EnumParamSpec(name="", label=label, enum_cls=enum_cls, default=default)
+    return dataclasses.field(default=default, metadata={_ENUM_META_KEY: spec})
+
+
+def get_enum_specs(segment) -> list[EnumParamSpec]:
+    """Introspect a segment instance or class, returning its `enum_param()` fields' specs."""
+    specs = []
+    for f in dataclasses.fields(segment):
+        spec = f.metadata.get(_ENUM_META_KEY)
+        if spec is not None:
+            specs.append(dataclasses.replace(spec, name=f.name))
+    return specs
+
+
+@dataclass(frozen=True)
+class OptionalGroupSpec:
+    """UI-facing description of one optional, toggleable sub-group of
+    parameters (e.g. "World movement", off by default) on a segment."""
+
+    name: str
+    label: str
+    group_cls: type
+
+
+def optional_group(*, label: str, group_cls: type) -> dataclasses.Field:
+    """Dataclass field wrapper for a nested, optional (default-off) sub-dataclass
+    of its own `param()`/`enum_param()` fields -- e.g. rotation_track's world
+    movement, hidden entirely until a checkbox turns it on. `group_cls` must be
+    a plain dataclass built the same way segments are (its own `param()` /
+    `enum_param()` fields)."""
+    spec = OptionalGroupSpec(name="", label=label, group_cls=group_cls)
+    return dataclasses.field(default=None, metadata={_GROUP_META_KEY: spec})
+
+
+def get_group_specs(segment) -> list[OptionalGroupSpec]:
+    """Introspect a segment instance or class, returning its `optional_group()` fields' specs."""
+    specs = []
+    for f in dataclasses.fields(segment):
+        spec = f.metadata.get(_GROUP_META_KEY)
+        if spec is not None:
+            specs.append(dataclasses.replace(spec, name=f.name))
+    return specs
+
+
 class SegmentBase(ABC):
     """Base class for a motion primitive.
 
@@ -93,8 +159,13 @@ class SegmentBase(ABC):
     frames: int
 
     @abstractmethod
-    def build(self, start_position: np.ndarray, start_rotation: Rotation) -> Trajectory:
+    def build(self, start_position: np.ndarray, start_rotation: Rotation, target_positions: np.ndarray) -> Trajectory:
         """Return a `self.frames`-frame Trajectory starting exactly at
         (start_position, start_rotation) and ending at this segment's
-        fully-applied motion."""
+        fully-applied motion.
+
+        `target_positions` is a (self.frames, 3) array giving the scene's
+        anchor object ("the box")'s position at each frame of this segment --
+        required for the interface to stay uniform, even though primitives
+        that don't need a target (e.g. free_form) just ignore it."""
         raise NotImplementedError

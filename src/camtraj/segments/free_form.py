@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation
 
 from ..easing import Easing, apply_easing
 from ..trajectory import Trajectory
-from .base import SegmentBase, param
+from .base import SegmentBase, enum_param, param
 
 _LATERAL_MARKS = {-1.0: "far_left", -2 / 3: "left", -1 / 3: "near_left", 0.0: "no",
                    1 / 3: "near_right", 2 / 3: "right", 1.0: "far_right"}
@@ -50,13 +50,14 @@ class FreeFormSegment(SegmentBase):
     pitch_deg: float = param(label="Pitch", min=-180.0, max=180.0, default=0.0, step=1.0, unit="deg")
     roll_deg: float = param(label="Roll / dutch", min=-180.0, max=180.0, default=0.0, step=1.0, unit="deg")
 
-    easing: Easing = Easing.LINEAR
+    easing: Easing = enum_param(label="Easing", enum_cls=Easing, default=Easing.LINEAR)
     easing_strength: float = param(
         label="Easing strength", min=0.0, max=1.0, default=0.5,
         marks={0.0: "off", 0.5: "default", 1.0: "full"},
     )
 
-    def build(self, start_position: np.ndarray, start_rotation: Rotation) -> Trajectory:
+    def build(self, start_position: np.ndarray, start_rotation: Rotation, target_positions: np.ndarray) -> Trajectory:
+        del target_positions  # free_form needs no target; kept only for interface uniformity
         n_frames = self.frames
         s = np.linspace(0.0, 1.0, n_frames)  # linear normalized progress -> linear frame indices
         s_eased = apply_easing(s, self.easing, self.easing_strength)  # eased motion progress

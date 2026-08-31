@@ -1,0 +1,1123 @@
+// Renders one free-floating window: a header handle (drags the whole window), a
+// vertical stack of tab groups (the snap group), and edge resize grips (width
+// on the sides, height on the bottom). Position is driven from layout state; the
+// DockManager applies a transform during an active drag for smoothness.
+
+import { Box, Paper } from "@mantine/core";
+import React from "react";
+import { flushSync } from "react-dom";
+import { useDock } from "./DockContext";
+import { exclusiveDragGesture } from "./gestures";
+import {
+  cappedWindowHeight,
+  cascadeResize,
+  stackDividerHeightPlan,
+  windowAllMinimized,
+} from "./layoutOps";
+import { StackHandleBar } from "./handles";
+import { TabGroupFrame } from "./TabGroupFrame";
+import { collapseAnim, windowCollapseAnim } from "./DockStyles.css";
+import { MinimizedBar } from "./MinimizedBar";
+import {
+  collapsedWindowHeightCss,
+  clamp,
+  CONTENT_SNAP_BAND_PX,
+  DIVIDER_GRAB_PX,
+  DOCK_ANIM_MS,
+  REGION_EDGE_GAP_PX,
+  FloatingWindow,
+  GroupId,
+  MIN_REGION_GRAB_PX,
+  MIN_WINDOW_HEIGHT_PX,
+  SPLIT_DIVIDER_PX,
+  pinnedPxOf,
+} from "./types";
+import {
+  dividerRuleStyle,
+  flankDetentDeltas,
+  measureNaturalHeight,
+  snapToDetent,
+} from "./detent";
+
+// A width-resize always leaves this much canvas visible (the original
+// FloatingPanel's resizeParentPad).
+const RESIZE_KEEP_CANVAS_PX = 100;
+const MIN_HEIGHT_PX = MIN_WINDOW_HEIGHT_PX;
+// Minimum height for one group in a resizable snap-stack.
+const MIN_STACK_CELL_PX = 50;
+// The stack divider's invisible grab overlay overhangs its layout seam on
+// each side, widening the grab zone to the shared DIVIDER_GRAB_PX (P11)
+// without thickening the drawn seam -- the same overhang the docked
+// SplitDivider derives.
+const DIVIDER_OVERHANG_PX = Math.max(
+  0,
+  (DIVIDER_GRAB_PX - SPLIT_DIVIDER_PX) / 2,
+);
+
+export const FloatingWindowView = React.memo(function FloatingWindowView({
+  win,
+  zIndex,
+  containerHeight,
+  onResize,
+  onResizeHeight,
+  onSetStackWeights,
+  onFront,
+}: {
+  win: FloatingWindow;
+  /** Paint order (front-order). Driven by z-index so raising a window never
+   * reorders the DOM (which would eat in-flight clicks). */
+  zIndex: number;
+  /** Dock container height; auto-height windows cap their scrolling body to
+   * it (like the original FloatingPanel capped its body to the parent). */
+  containerHeight: number;
+  /** width plus, for left-edge resizes, the new x (so the right edge stays).
+   * All handlers are windowId-first and STABLE, so this component can be
+   * memoized (a re-render of the manager with an unchanged window skips it). */
+  onResize: (windowId: string, width: number, x?: number) => void;
+  /** Set the window's pinned height in px, or `undefined` to revert it to
+   * auto-height (tracks content). */
+  onResizeHeight: (
+    windowId: string,
+    height: number | undefined,
+    y?: number,
+  ) => void;
+  /** Merge per-group stack height weights (groupId -> weight). */
+  onSetStackWeights: (
+    windowId: string,
+    weights: Record<GroupId, number>,
+  ) => void;
+  onFront: (windowId: string) => void;
+}) {
+  const dock = useDock();
+  const multi = win.stack.length > 1;
+  const paperRef = React.useRef<HTMLDivElement>(null);
+  const stackRef = React.useRef<HTMLDivElement>(null);
+  // A collapsed window shrinks to its stack of bars; it ignores any fixed
+  // height and offers no vertical resize (there's nothing to resize).
+  const collapsed = windowAllMinimized(dock.layout, win.id);
+  // The window's ONE collapse toggle (D38): the header's right-end control
+  // (multi-group windows; a single-group window's grip bar toggle sets the
+  // same flag). Plain collapse/expand of the window -- the old "minimize
+  // all / expand all" pair is simply this toggle.
+  // A USER gesture: routed through setStackCollapsed (the dock's user
+  // path), not api.apply, so ownership arbitration sees it (P6).
+  const toggleWindowCollapsed = () =>
+    dock.setStackCollapsed(win.stack, !collapsed);
+  // The pinned px height, or undefined when the window auto-sizes to content.
+  // flex-grow sums < 1 distribute only that FRACTION of free space;
+  // stackWeights from floatRegion carving are fractional, so
+  // normalize (see SplitView's grow-normalization note).
+  const stackWeightTotal =
+    win.stack.reduce((s2, g) => s2 + (win.stackWeights?.[g] ?? 1), 0) || 1;
+  const pinnedPx = pinnedPxOf(win.height);
+  const fixedHeight = pinnedPx !== undefined && !collapsed;
+  const renderedHeight =
+    pinnedPx !== undefined
+      ? cappedWindowHeight(pinnedPx, containerHeight)
+      : undefined;
+  // The collapsed window's height as a deterministic calc() (header + bars +
+  // dividers) rather than `auto`: it gives the D34 height transition an
+  // honest numeric endpoint, so collapsing a PINNED window eases px -> calc
+  // and expanding eases back. (An AUTO-height window's expanded height is
+  // `auto`, which CSS cannot interpolate -- that direction snaps; see the
+  // windowCollapseAnim note.)
+  const collapsedHeight = collapsed
+    ? collapsedWindowHeightCss(
+        win.stack.map((g) => dock.groups[g]),
+        dock.panes,
+      )
+    : undefined;
+
+  // D34 for AUTO-height windows ONLY: CSS cannot interpolate height to
+  // `auto`, so a collapse/expand of an unpinned window snapped. Ease it
+  // with a Web Animations API height animation (el.animate old px -> new
+  // px) instead of a style-channel FLIP: the script animation composites
+  // ABOVE the style attribute, so React re-renders rewriting the Paper's
+  // style prop cannot wipe the in-flight motion (the old FLIP needed a
+  // target token re-asserted every render), and it outranks the class's
+  // CSS height transition, so windowCollapseAnim cannot collide with it.
+  // The Animation object's own finish/cancel callbacks replace the old
+  // transition-event forensics (bubbled-event filtering, transitioncancel
+  // guards, getAnimations probing). Presentation only (P4): the model
+  // committed first, and the callbacks do cosmetic cleanup only. Reduced
+  // motion and an active grip drag (the paper's own [data-dock-resizing])
+  // skip it; a rapid re-toggle cancels the held Animation and retargets
+  // from the live mid-ease rect.
+  //
+  // PINNED windows must NOT get the script animation: both of their
+  // committed endpoints are already numeric (px <-> the bars' calc()), so
+  // windowCollapseAnim eases the commit natively -- a WAAPI animation
+  // armed on top would outrank and freeze that transition. Skipping
+  // pinned windows keeps their native ease exactly as before.
+  const prevPaperH = React.useRef<number | null>(null);
+  // The in-flight auto-height Animation (plus its target px, the honest
+  // "where did it settle" fallback for the moment between the animation
+  // finishing and its finish event delivering), held so the next toggle
+  // can cancel it and retarget. The handle IS the flip: no id token
+  // needed, because canceling it can't be confused with anyone else's
+  // events.
+  const heightAnim = React.useRef<{ anim: Animation; toPx: number } | null>(
+    null,
+  );
+  React.useLayoutEffect(() => {
+    const el = paperRef.current;
+    if (el === null) return;
+    // Drop the held animation (ref nulled BEFORE cancel, so oncancel's
+    // guard makes it a no-op) and release the clip.
+    const dropHeld = () => {
+      const held = heightAnim.current;
+      if (held === null) return;
+      heightAnim.current = null;
+      held.anim.cancel();
+      el.style.overflow = "";
+    };
+    // Pinned windows: the class transition eases px <-> calc natively
+    // (see the block comment above). Drop any auto-height animation a pin
+    // interrupted, so nothing outranks that transition -- which is why
+    // `pinnedPx` is in this effect's deps: a PIN-ONLY commit (server
+    // set_height, the stack divider's auto->pinned flip) landing while a
+    // collapse ease is in flight must reach this dropHeld too, or the held
+    // animation outranks the new pinned height until onfinish
+    // (freeze-then-snap).
+    if (pinnedPx !== undefined) {
+      dropHeld();
+      return;
+    }
+    // Retarget from where the window VISUALLY is: while the previous
+    // animation runs, the rect reads its mid-ease height (the animation
+    // composites into layout). If it already finished but its finish
+    // event hasn't delivered yet (so the cleanup below hasn't refreshed
+    // the recording), the window sits at that animation's own target. In
+    // every other case the rect already shows the NEW committed height,
+    // so use the per-render recording below instead.
+    const held = heightAnim.current;
+    const from =
+      held === null
+        ? prevPaperH.current
+        : held.anim.playState === "running"
+          ? el.getBoundingClientRect().height
+          : held.toPx;
+    dropHeld();
+    const skip =
+      el.hasAttribute("data-dock-resizing") ||
+      (typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    if (from === null || skip) return;
+    // Measure the committed endpoint with the class transition
+    // neutralized: a same-commit un-pin + collapse rewrites the height
+    // px -> the bars' calc() -- BOTH numeric, so windowCollapseAnim
+    // starts transitioning at the commit and a plain read here would
+    // return the transition's t~0 value (the OLD height) instead of the
+    // committed one. transition:none cancels it -- correctly: the window
+    // is auto now, so its motion belongs to the script animation.
+    el.style.transition = "none";
+    const to = el.offsetHeight;
+    el.style.transition = "";
+    if (Math.abs(from - to) < 0.5) return;
+    // Clip while the ease is in flight: an EXPAND eases the paper up
+    // around already-mounted full-size content, which would poke out of
+    // the small mid-anim box (Paper's steady-state overflow is visible
+    // for the grips). ONE channel: this inline write, re-asserted by the
+    // recorder effect below before every paint (a React style-prop
+    // rewrite can strip it, but never visibly). Keyframed overflow would
+    // be unwipeable on newer engines, but carrying both channels for one
+    // cosmetic clip is more machinery than the clip is worth.
+    el.style.overflow = "hidden";
+    const anim = el.animate([{ height: `${from}px` }, { height: `${to}px` }], {
+      duration: DOCK_ANIM_MS,
+      easing: "ease",
+    });
+    heightAnim.current = { anim, toPx: to };
+    anim.onfinish = () => {
+      if (heightAnim.current?.anim !== anim) return; // superseded; not ours
+      heightAnim.current = null;
+      el.style.overflow = "";
+      // The animation moved the height WITHOUT a render, so the per-render
+      // recorder below never saw the settled value. Refresh it here, or
+      // the NEXT toggle reads the pre-flip height as `from`, concludes
+      // from == to, and skips its ease -- which is exactly why expanding
+      // right after a settled minimize (or vice versa) snapped when
+      // nothing else re-rendered the window in between.
+      prevPaperH.current = el.getBoundingClientRect().height;
+    };
+    anim.oncancel = () => {
+      // Reachable only outside the toggle path (that path nulls the ref
+      // BEFORE canceling, and the guard makes this a no-op): e.g. the
+      // browser canceling animations on a display change.
+      if (heightAnim.current?.anim !== anim) return;
+      heightAnim.current = null;
+      el.style.overflow = "";
+    };
+  }, [collapsed, pinnedPx]);
+  React.useLayoutEffect(() => {
+    const el = paperRef.current;
+    // Old-engine insurance for the clip (see the keyframes note above):
+    // a re-render rewrote the style prop, which can strip the inline
+    // overflow; the height itself needs no such help (WAAPI outranks the
+    // style attribute).
+    if (el !== null && heightAnim.current !== null)
+      el.style.overflow = "hidden";
+    // Live height (mid-ease included -- the animated height shows in the
+    // rect) so an interrupted toggle continues from where the window
+    // visually is. Pinned windows skip the read (the WAAPI arm never
+    // consumes it for them -- their class transition eases natively) but
+    // KEEP the last recorded value: a single commit that both un-pins and
+    // toggles collapse then eases from a slightly stale height instead of
+    // snapping.
+    if (!(pinnedPx !== undefined && heightAnim.current === null))
+      prevPaperH.current = el?.getBoundingClientRect().height ?? null;
+  });
+
+  // Cancel an in-flight grip gesture if this window unmounts mid-resize (e.g.
+  // another client docks it away), so its listeners can't fire afterwards. One
+  // ref serves all grips for unmount cleanup; gesture EXCLUSION is the
+  // dock-wide slot (spec §4: one active gesture at a time, extra pointers
+  // ignored) -- a second finger on any grip, divider, or drag surface is
+  // ignored while one gesture is running anywhere in the dock.
+  const activeGrip = React.useRef<(() => void) | null>(null);
+  React.useEffect(() => () => activeGrip.current?.(), []);
+  // True while a height resize is magnetized to the content-height detent (the
+  // "revert to auto" position). Drives the bottom-edge highlight so the snap is
+  // visible. Reset when the gesture ends.
+  const [snappedToContent, setSnappedToContent] = React.useState(false);
+
+  // Container-relative width cap: like the original FloatingPanel, a resize
+  // always leaves a sliver of canvas visible (it may never consume the whole
+  // container). There is no absolute max width -- the only ceiling is the
+  // container minus a canvas sliver.
+  const maxResizeWidth = () => {
+    const containerW = paperRef.current?.parentElement?.clientWidth ?? Infinity;
+    return Math.max(MIN_REGION_GRAB_PX, containerW - RESIZE_KEEP_CANVAS_PX);
+  };
+
+  // Start-of-gesture math shared by every horizontal resize (the vertical
+  // analog is vResizeStart): the right edge is held in parent coords and kept
+  // fixed when resizing from the left by moving x with the width.
+  const wResizeStart = (side: "left" | "right") => {
+    const startWidth = win.width;
+    const startRight = win.x + win.width;
+    const maxW = maxResizeWidth();
+    // Left-edge resize: keep the right edge fixed by moving x.
+    const xFor = (w: number) => (side === "left" ? startRight - w : undefined);
+    return {
+      startWidth,
+      widthFrom: (dx: number) =>
+        clamp(
+          side === "right" ? startWidth + dx : startWidth - dx,
+          MIN_REGION_GRAB_PX,
+          maxW,
+        ),
+      xFor,
+      // What a CANCEL must commit: the start width at the start position.
+      startXRestore: xFor(startWidth),
+    };
+  };
+
+  const widthResizeHandler =
+    (side: "left" | "right") => (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      if (dock.gestureSlot.current !== null) return; // one gesture at a time (§4)
+      event.stopPropagation();
+      const startX = event.clientX;
+      const { startWidth, widthFrom, xFor, startXRestore } = wResizeStart(side);
+
+      let pending = startWidth;
+      let pendingX: number | undefined = undefined;
+      activeGrip.current = exclusiveDragGesture(dock.gestureSlot, {
+        grip: event.currentTarget,
+        pointerId: event.pointerId,
+        update: (e) => {
+          pending = widthFrom(e.clientX - startX);
+          pendingX = xFor(pending);
+        },
+        flush: () => onResize(win.id, pending, pendingX),
+        onEnd: (cancelled) => {
+          activeGrip.current = null;
+          // Cancel (Escape) reverts the per-frame resizes to the start size.
+          if (cancelled) onResize(win.id, startWidth, startXRestore);
+        },
+      });
+    };
+
+  // The window's NATURAL content height: what it would auto-size to, INVARIANT
+  // of the current window height (measureNaturalHeight in detent.ts -- the
+  // same formula the height dividers apply per CELL). Used as the resize
+  // FLOOR and the detent target.
+  const measureContentHeight = () => {
+    const paper = paperRef.current;
+    return paper === null ? MIN_HEIGHT_PX : measureNaturalHeight(paper);
+  };
+
+  // The resize ceiling is the CONTAINER edge only -- never the content height.
+  // A window (single panel OR stack) can be dragged taller than its content;
+  // the extra space is empty for a lone panel and shared by weight in a stack,
+  // exactly like a docked panel filling its region. (Previously content height
+  // was the max, so a freshly-floated stack snapped SMALLER when grown.)
+  const measureMaxHeight = () => {
+    const paper = paperRef.current;
+    return (paper?.parentElement?.clientHeight ?? 2000) - 16;
+  };
+
+  // Magnetic detent at the natural content height (CONTENT_SNAP_BAND_PX,
+  // D56): dragging the edge within the band of the content height snaps it
+  // exactly there, which is the single "revert to auto" position (the window
+  // then tracks its content again). The grip highlights while snapped so the
+  // snap is discoverable.
+
+  // Start-of-gesture math shared by every vertical resize: top-side grips
+  // hold the BOTTOM edge fixed by moving y with the height (the vertical
+  // analog of a left-edge width resize), with the height additionally capped
+  // at the start bottom so the top edge can't leave the container.
+  const vResizeStart = (vside: "top" | "bottom") => {
+    const startHeight = paperRef.current?.offsetHeight ?? pinnedPx ?? 200;
+    const startBottom = win.y + startHeight;
+    const contentHeight = measureContentHeight();
+    const maxHeight =
+      vside === "top"
+        ? Math.min(measureMaxHeight(), startBottom)
+        : measureMaxHeight();
+    // Floor at the content height when it's below MIN_HEIGHT_PX, so a short
+    // panel (e.g. one button) can shrink back to its natural size rather than
+    // being trapped at the 50px minimum.
+    const minHeight = Math.min(MIN_HEIGHT_PX, contentHeight);
+    // The content-height detent only exists when content fits the resize range
+    // (it can be outside it for a top grip whose bottom edge is fixed, or when
+    // content is below the min floor).
+    const contentReachable =
+      contentHeight >= minHeight && contentHeight <= maxHeight;
+    // True when `h` landed in the detent (so it equals content height).
+    const snappedToContent = (h: number) =>
+      contentReachable && Math.abs(h - contentHeight) < 0.5;
+    return {
+      startHeight,
+      // What a CANCEL must commit: the pre-gesture mode, not just the px. An
+      // auto window (pinnedPx undefined) returns to auto -- committing the
+      // measured startHeight would silently pin it and stop it tracking
+      // content (P2: "modes return to pre-gesture values", same rule as the
+      // stack divider's cancel).
+      startHeightCommit: pinnedPx,
+      heightFrom: (dy: number) => {
+        const raw = clamp(
+          vside === "top" ? startHeight - dy : startHeight + dy,
+          minHeight,
+          maxHeight,
+        );
+        // Magnetize to the content height when within the snap band (the
+        // shared detent math -- snapToDetent, D56).
+        return snapToDetent(
+          raw,
+          contentReachable ? [contentHeight] : [],
+          CONTENT_SNAP_BAND_PX,
+        ).value;
+      },
+      snappedToContent,
+      yFor: (h: number) => (vside === "top" ? startBottom - h : undefined),
+      // Snapped to the content detent -> revert to auto (undefined) so the
+      // window tracks its content again. Any other height pins (taller =
+      // empty/weight-shared space; shorter = the body scrolls).
+      heightToCommit: (h: number): number | undefined =>
+        snappedToContent(h) ? undefined : h,
+    };
+  };
+
+  const heightResizeHandler =
+    (vside: "top" | "bottom") =>
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      if (dock.gestureSlot.current !== null) return; // one gesture at a time (§4)
+      event.stopPropagation();
+      // Per-frame height writes must track the cursor 1:1: suppress the D34
+      // height ease (windowCollapseAnim) on this window for the drag.
+      paperRef.current?.setAttribute("data-dock-resizing", "");
+      const startY = event.clientY;
+      const {
+        startHeight,
+        startHeightCommit,
+        heightFrom,
+        snappedToContent,
+        yFor,
+        heightToCommit,
+      } = vResizeStart(vside);
+
+      let pending = startHeight;
+      activeGrip.current = exclusiveDragGesture(dock.gestureSlot, {
+        grip: event.currentTarget,
+        pointerId: event.pointerId,
+        update: (e) => {
+          pending = heightFrom(e.clientY - startY);
+          setSnappedToContent(snappedToContent(pending));
+        },
+        flush: () =>
+          onResizeHeight(win.id, heightToCommit(pending), yFor(pending)),
+        onEnd: (cancelled) => {
+          activeGrip.current = null;
+          paperRef.current?.removeAttribute("data-dock-resizing");
+          setSnappedToContent(false);
+          if (cancelled)
+            onResizeHeight(win.id, startHeightCommit, yFor(startHeight));
+        },
+      });
+    };
+
+  // Corner grips: resize width AND height together. The grabbed corner moves;
+  // the opposite edges stay fixed (left grab moves x, top grab moves y).
+  const cornerResizeHandler =
+    (side: "left" | "right", vside: "top" | "bottom" = "bottom") =>
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      if (dock.gestureSlot.current !== null) return; // one gesture at a time (§4)
+      event.stopPropagation();
+      // Corner drags also write height per frame: suppress the D34 ease.
+      paperRef.current?.setAttribute("data-dock-resizing", "");
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const { startWidth, widthFrom, xFor, startXRestore } = wResizeStart(side);
+      const {
+        startHeight,
+        startHeightCommit,
+        heightFrom,
+        snappedToContent,
+        yFor,
+        heightToCommit,
+      } = vResizeStart(vside);
+
+      let pendingW = startWidth;
+      let pendingX: number | undefined = undefined;
+      let pendingH = startHeight;
+      // Suppress the width-ease while dragging the corner (width tracks 1:1).
+      activeGrip.current = exclusiveDragGesture(dock.gestureSlot, {
+        grip: event.currentTarget,
+        pointerId: event.pointerId,
+        update: (e) => {
+          pendingW = widthFrom(e.clientX - startX);
+          pendingX = xFor(pendingW);
+          pendingH = heightFrom(e.clientY - startY);
+          setSnappedToContent(snappedToContent(pendingH));
+        },
+        flush: () => {
+          onResize(win.id, pendingW, pendingX);
+          onResizeHeight(win.id, heightToCommit(pendingH), yFor(pendingH));
+        },
+        onEnd: (cancelled) => {
+          activeGrip.current = null;
+          paperRef.current?.removeAttribute("data-dock-resizing");
+          setSnappedToContent(false);
+          if (cancelled) {
+            onResize(win.id, startWidth, startXRestore);
+            onResizeHeight(win.id, startHeightCommit, yFor(startHeight));
+          }
+        },
+      });
+    };
+
+  return (
+    <Paper
+      ref={paperRef}
+      data-floating-window={win.id}
+      // Matches the live FloatingPanel's subtle shadow exactly.
+      shadow="0.1em 0 1em 0 rgba(0,0,0,0.1)"
+      radius="sm"
+      onPointerDownCapture={() => onFront(win.id)}
+      className={windowCollapseAnim}
+      style={{
+        position: "absolute",
+        left: win.x,
+        top: win.y,
+        // A collapsed window is the same stack of cells, all rendered as
+        // 26px bars (D17) at full win.width -- the width is part of the
+        // window's identity (P8); no fit-content jump. Its height is the
+        // bars' computed sum (numeric, so the collapse can ease -- D34).
+        width: win.width,
+        height: collapsed ? collapsedHeight : renderedHeight,
+        zIndex,
+        overflow: "visible",
+        boxSizing: "border-box",
+        // When height is fixed, lay the stack out as a flex column so groups
+        // share the height and scroll internally.
+        ...(fixedHeight
+          ? { display: "flex", flexDirection: "column" as const }
+          : {}),
+      }}
+    >
+      {/* Edge resize grips. None when minimized -- the strip is fixed-size
+      chrome, nothing to resize VERTICALLY -- but width stays resizable
+      (D15): the minimized bar keeps win.width (P8), and that width is
+      user-adjustable in either state. */}
+      <ResizeGrip edge="left" onPointerDown={widthResizeHandler("left")} />
+      <ResizeGrip edge="right" onPointerDown={widthResizeHandler("right")} />
+      {!collapsed && (
+        <>
+          <ResizeGrip
+            edge="bottom"
+            onPointerDown={heightResizeHandler("bottom")}
+          />
+          <ResizeGrip edge="top" onPointerDown={heightResizeHandler("top")} />
+          <ResizeGrip
+            edge="bottom-left"
+            onPointerDown={cornerResizeHandler("left")}
+          />
+          <ResizeGrip
+            edge="bottom-right"
+            onPointerDown={cornerResizeHandler("right")}
+          />
+          <ResizeGrip
+            edge="top-left"
+            onPointerDown={cornerResizeHandler("left", "top")}
+          />
+          <ResizeGrip
+            edge="top-right"
+            onPointerDown={cornerResizeHandler("right", "top")}
+          />
+        </>
+      )}
+
+      {/* Snap cue: while a height resize is magnetized to the content-height
+      detent (the "revert to auto" position), highlight the bottom edge so the
+      snap is visible -- the window is back to hugging its content. */}
+      {snappedToContent && (
+        <Box
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: 2,
+            backgroundColor: "var(--mantine-primary-color-filled)",
+            zIndex: 14,
+            pointerEvents: "none",
+          }}
+        />
+      )}
+
+      <Box
+        style={{
+          overflow: "hidden",
+          borderRadius: "inherit",
+          ...(fixedHeight
+            ? {
+                flexGrow: 1,
+                minHeight: 0,
+                display: "flex",
+                flexDirection: "column" as const,
+              }
+            : {}),
+        }}
+      >
+        <>
+          {/* For a multi-group stack, a window header drags the whole window; each
+        group also keeps its own grip bar (which tears it out). A single group
+        needs no header -- its own grip bar moves the window. The header's
+        right-end toggle flips the window's ONE collapse flag (D38); it is
+        the collapsed window's ONLY expand signifier (T4 -> D25: the bars
+        below carry no individual +, staying unmarked backing). Rendered
+        even when the whole stack is bars (D17): a collapsed window is the
+        same stack of cells, just all 26px. A motionless press toggles (via
+        the drag-starter's onClick, since the +/- is dragThrough); motion
+        drags. */}
+          {multi && (
+            <StackHandleBar
+              attrs={{ "data-floating-handle": win.id }}
+              onPointerDown={(event) =>
+                dock.startWindowDrag(event, win.id, {
+                  onClick: toggleWindowCollapsed,
+                })
+              }
+              collapsed={collapsed}
+              onToggle={toggleWindowCollapsed}
+            />
+          )}
+
+          <Box
+            ref={stackRef}
+            {...(fixedHeight ? { "data-dock-scroll": "" } : {})}
+            style={{
+              // Collapsed multi-group window: rule off the window header from
+              // the first bar -- every other bar boundary draws a divider, and
+              // an unmarked header/bar seam reads as one surface (user
+              // report: "there should be a horizontal line above the
+              // Stats/Notes row").
+              ...(collapsed && multi
+                ? {
+                    // Same recipe as the bar-to-bar divider rules (1px
+                    // default-border at half opacity), so all the window's
+                    // horizontal lines read as one family.
+                    borderTop:
+                      "1px solid color-mix(in srgb, var(--mantine-color-default-border) 50%, transparent)",
+                  }
+                : {}),
+              // D54's floating analog (P7): a MULTI-group window is a
+              // container of panels, so its stack sits in the same horizontal
+              // gutter the docked regions give their columns (cells and
+              // collapsed bars alike -- the bars' inset mirrors the
+              // rail-in-region treatment), with the header full-bleed like
+              // the docked handle rows. A SINGLE-group window is exempt: the
+              // window IS the panel (its paper is the panel's own frame), so
+              // an internal gutter would be padding around nothing.
+              // Horizontal only; no height math changes.
+              paddingLeft: multi ? REGION_EDGE_GAP_PX : 0,
+              paddingRight: multi ? REGION_EDGE_GAP_PX : 0,
+              ...(fixedHeight
+                ? {
+                    flexGrow: 1,
+                    minHeight: 0,
+                    display: "flex",
+                    flexDirection: "column",
+                    // If the pinned height is too short to fit every cell at its
+                    // min-content (e.g. a 3-panel stack squeezed very short), the
+                    // stack SCROLLS rather than letting cells collapse below their
+                    // headers and overlap each other. Marked data-dock-scroll
+                    // (like a squeezed docked column) so the drop-target scan
+                    // clips cells and their chrome to the visible viewport --
+                    // a scrolled-out cell must not stay a target (P1).
+                    overflowY: "auto",
+                  }
+                : {}),
+            }}
+          >
+            {win.stack.map((groupId, index) => {
+              const group = dock.groups[groupId];
+              if (group === undefined) return null;
+              const weight = win.stackWeights?.[groupId] ?? 1;
+              // D38: the window's ONE flag decides every cell's rendering --
+              // a collapsed window renders every cell as its bar (a
+              // single-group window = one bar; face bar for a face pane).
+              // The bar's right-end + renders only when the bar IS the whole
+              // window (T4 -> D25: a multi-group window's expand signifier
+              // is its header's toggle alone).
+              const groupNode = collapsed ? (
+                <MinimizedBar group={group} expandControl={!multi} />
+              ) : (
+                <TabGroupFrame
+                  group={group}
+                  // Fixed-height windows: groups fill and share the height (the
+                  // wrapper carries the per-group weight). Auto-height: size to
+                  // content, capped to the dock container's height (minus a
+                  // margin) like the original FloatingPanel -- falling back to a
+                  // fixed cap before the first container measure.
+                  fill={fixedHeight}
+                  maxContentHeight={
+                    multi
+                      ? 320
+                      : containerHeight > 0
+                        ? Math.max(200, containerHeight - 30)
+                        : 600
+                  }
+                  stripDragsGroup
+                />
+              );
+              return (
+                <React.Fragment key={groupId}>
+                  {index > 0 && (
+                    // Draggable: redistribute height between the stacked groups
+                    // (same cascade as docked column splits). On an auto-height
+                    // window the first drag pins the current height so there is a
+                    // total to divide.
+                    <FloatingStackDivider
+                      stackRef={stackRef}
+                      paperRef={paperRef}
+                      dividerIndex={index - 1}
+                      stack={win.stack}
+                      // D38: an expanded window is all expanded cells (every
+                      // divider trades); a collapsed one is all bars (none do).
+                      resizable={!collapsed}
+                      weightOf={(g) => win.stackWeights?.[g] ?? 1}
+                      onSetWeights={(weights) =>
+                        onSetStackWeights(win.id, weights)
+                      }
+                      isFixed={fixedHeight}
+                      // The STORED pin (uncapped): what a cancel/motionless
+                      // press must restore (stackDividerHeightPlan).
+                      pinnedPx={pinnedPx}
+                      setWindowHeight={(px) => onResizeHeight(win.id, px)}
+                    />
+                  )}
+                  {fixedHeight ? (
+                    // Expanded pinned window only (fixedHeight is false while
+                    // collapsed): cells share the pinned height by weight.
+                    <Box
+                      className={collapseAnim}
+                      style={{
+                        flexGrow: weight / stackWeightTotal,
+                        flexShrink: 1,
+                        flexBasis: 0,
+                        // Never shrink below a cell's header: minHeight:0 let an
+                        // over-short window collapse a cell under its header,
+                        // clipping it and overlapping the next cell. Floor at the
+                        // min stack-cell height; the stack scrolls when the sum
+                        // exceeds the window.
+                        minHeight: MIN_STACK_CELL_PX,
+                        display: "flex",
+                        flexDirection: "column",
+                        // Clip: children render committed-size instantly, the
+                        // wrapper eases (see collapseAnim).
+                        overflow: "hidden",
+                      }}
+                    >
+                      {groupNode}
+                    </Box>
+                  ) : (
+                    groupNode
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </Box>
+        </>
+      </Box>
+    </Paper>
+  );
+});
+
+/** Draggable divider between two groups in a fixed-height floating snap-stack.
+ * Redistributes height between the stacked groups using the same cascade as
+ * docked column splits, writing per-group weights (by id). */
+function FloatingStackDivider({
+  stackRef,
+  paperRef,
+  dividerIndex,
+  stack,
+  resizable,
+  weightOf,
+  onSetWeights,
+  isFixed,
+  pinnedPx,
+  setWindowHeight,
+}: {
+  stackRef: React.RefObject<HTMLDivElement | null>;
+  paperRef: React.RefObject<HTMLDivElement | null>;
+  dividerIndex: number;
+  stack: GroupId[];
+  /** False while the window is collapsed (all bars, D38): nothing to trade,
+   * so no resize cursor, no armed gesture, and no pin side effect. */
+  resizable: boolean;
+  weightOf: (g: GroupId) => number;
+  onSetWeights: (weights: Record<GroupId, number>) => void;
+  /** Whether the window already has a fixed height (so weights apply directly).
+   * If false, the drag pins the current rendered height -- seeded with the
+   * cells' RENDERED px (same rule as docked divider drags), so entering
+   * pinned mode reproduces the exact on-screen layout and a motionless
+   * click cannot move anything. */
+  isFixed: boolean;
+  /** The STORED pin (pinnedPxOf(win.height)) -- uncapped, unlike the paper's
+   * rendered offsetHeight -- so a cancel/motionless press restores exactly
+   * it (stackDividerHeightPlan / P2). Undefined for an auto window. */
+  pinnedPx: number | undefined;
+  /** Pin (px) or restore auto (undefined) -- the window height writer. */
+  setWindowHeight: (px: number | undefined) => void;
+}) {
+  // The dock-wide one-gesture mutex (spec §4), shared via context.
+  const { gestureSlot } = useDock();
+  // Cancel the in-flight gesture if the divider unmounts mid-drag (the stack
+  // can be restructured by another client), so the window listeners can't fire
+  // after unmount and the shared `resizing` flag can't stick true.
+  const activeDrag = React.useRef<(() => void) | null>(null);
+  React.useEffect(() => () => activeDrag.current?.(), []);
+  // True while the drag is magnetized to a flanking cell's content-height
+  // detent (D56). Drives the rule tint + data-dock-divider-snapped, the
+  // divider analog of the window grip's snappedToContent cue.
+  const [snapped, setSnapped] = React.useState(false);
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizable) return;
+    if (event.button !== 0) return;
+    // One gesture at a time, dock-wide (spec §4): a press while any gesture
+    // is live is ignored -- checked BEFORE the pin/weight side effects below.
+    if (gestureSlot.current !== null) return;
+    event.stopPropagation();
+    const container = stackRef.current;
+    if (container === null) return;
+    const containerPx = container.getBoundingClientRect().height;
+    // Suppress the minimize/expand transition under this stack for the
+    // drag's duration (per-frame weight writes must land instantly). The
+    // paper carries it too, so the window-height ease (windowCollapseAnim
+    // + the auto-height FLIP) stays out of per-frame height writes.
+    container.setAttribute("data-dock-resizing", "");
+    paperRef.current?.setAttribute("data-dock-resizing", "");
+    // The RENDERED height (capped) for live drag math, and the height plan
+    // separating it from the STORED pin a cancel must commit
+    // (stackDividerHeightPlan: committing the rendered height on a
+    // motionless press rewrote a stored 700px pin to the capped px).
+    const paperStartH = paperRef.current?.offsetHeight ?? containerPx;
+    const wasFixed = isFixed;
+    const heightPlan = stackDividerHeightPlan({
+      storedPinnedPx: wasFixed ? pinnedPx : undefined,
+      renderedPx: paperStartH,
+    });
+    // Snapshot the cells' RENDERED heights BEFORE any mode change: these
+    // seed the pinned-mode weights, so flipping an auto window to fixed
+    // reproduces the exact on-screen layout (the old path seeded stored
+    // flex shares -- often 1:1 -- and the stack visibly JUMPED on a plain
+    // pointerdown; P2: a motionless click never moves).
+    const renderedPx: Record<string, number> = {};
+    const cellEls: Record<string, HTMLElement | null> = {};
+    stack.forEach((g) => {
+      const cellEl = container.querySelector<HTMLElement>(
+        `[data-dock-group="${CSS.escape(g)}"]`,
+      );
+      cellEls[g] = cellEl;
+      renderedPx[g] = cellEl?.offsetHeight ?? containerPx / stack.length;
+    });
+    // Drag-start weights so a cancel (or motionless click) restores them.
+    const startWeights: Record<string, number> = {};
+    stack.forEach((g) => {
+      startWeights[g] = weightOf(g);
+    });
+    if (heightPlan.pinOnDown !== null) {
+      setWindowHeight(heightPlan.pinOnDown);
+      onSetWeights(renderedPx);
+    }
+    const start = event.clientY;
+    let latest = start;
+    // Push-through budget (user-adjudicated): dragging DOWN past the point
+    // where every cell below the divider sits at its minimum keeps going by
+    // GROWING the window -- the excess lands on the cell above the divider.
+    // Budget from the drag-start RENDERED snapshot in both modes: stored
+    // stackWeights are scale-free (snapToWindowStack seeds ~1s; rendering
+    // normalizes), so reading them as px on an already-pinned stack computes
+    // a zero belowCapacity and routes the whole downward delta into window
+    // growth while the lower cell never shrinks. renderedPx is the on-screen
+    // truth in px regardless of mode, and committing px-scale weights is
+    // exactly what the auto->pinned path already does (cascadeResize and the
+    // renderer both normalize).
+    const startPx = stack.map((g) => renderedPx[g]);
+    const belowCapacity = startPx
+      .slice(dividerIndex + 1)
+      .reduce((s, px) => s + Math.max(0, px - MIN_STACK_CELL_PX), 0);
+    // Content-height detent (D56): measure every cell's natural content
+    // height ONCE at drag start (same rule as the window grip's
+    // vResizeStart) -- the flanks feed the magnet (flankDetentDeltas holds
+    // the scale-conversion math), the full list feeds the release arm
+    // below.
+    const contentPx: (number | null)[] = stack.map((g) => {
+      const el = cellEls[g];
+      return el === null ? null : measureNaturalHeight(el);
+    });
+    const renderedTotal = stack.reduce((s, g) => s + renderedPx[g], 0);
+    // Rendered px <-> normalized drag scale; the release arm below also
+    // divides by it to compare committed cells against content heights.
+    const scale = renderedTotal > 0 ? containerPx / renderedTotal : 1;
+    const startPxTotal = startPx.reduce((a, b) => a + b, 0) || 1;
+    const n0 = startPx.map((w) => (w / startPxTotal) * containerPx);
+    const detentDeltas = flankDetentDeltas({
+      scale,
+      n0Above: n0[dividerIndex],
+      n0Below: n0[dividerIndex + 1],
+      contentAbove: contentPx[dividerIndex],
+      contentBelow: contentPx[dividerIndex + 1],
+      minPx: MIN_STACK_CELL_PX,
+    });
+    // The last committed cascade result + push-through, for the release arm.
+    let lastNext: number[] | null = null;
+    let lastExtra = 0;
+    const maxPaperH = () => {
+      const parent = paperRef.current?.parentElement;
+      if (!parent || paperRef.current === null) return Infinity;
+      const y = paperRef.current.offsetTop;
+      return Math.max(paperStartH, parent.clientHeight - y);
+    };
+    activeDrag.current = exclusiveDragGesture(gestureSlot, {
+      grip: event.currentTarget,
+      pointerId: event.pointerId,
+      update: (e) => {
+        latest = e.clientY;
+      },
+      flush: () => {
+        // D38: dividers only exist on an EXPANDED window (a collapsed one is
+        // all bars and none of its seams are resizable), so the mask is
+        // uniformly false.
+        const collapsed = stack.map(() => false);
+        // Magnetize the cursor delta to the nearest flanking-cell
+        // content-height detent within the band (D56; nearest wins when
+        // both flanks are in band). The snap replaces the raw delta BEFORE
+        // the push-through split so both parts stay consistent with it.
+        const { value: totalDelta, snapped: hit } = snapToDetent(
+          latest - start,
+          detentDeltas,
+          CONTENT_SNAP_BAND_PX,
+        );
+        setSnapped(hit);
+        // Split the downward delta into the zero-sum part (traded with the
+        // cells below) and the push-through part (window growth).
+        const extra =
+          totalDelta > 0
+            ? Math.min(
+                Math.max(0, totalDelta - belowCapacity),
+                maxPaperH() - paperStartH,
+              )
+            : 0;
+        const next = cascadeResize({
+          weights: startPx.slice(),
+          collapsed,
+          containerPx,
+          dividerIndex,
+          deltaPx: totalDelta - extra,
+          minCell: MIN_STACK_CELL_PX,
+          maxCell: Infinity,
+        });
+        if (next === null) return;
+        if (extra > 0) next[dividerIndex] += extra;
+        lastNext = next;
+        lastExtra = extra;
+        const wmap: Record<string, number> = {};
+        stack.forEach((g, i) => {
+          if (!collapsed[i]) wmap[g] = next[i];
+        });
+        onSetWeights(wmap);
+        setWindowHeight(paperStartH + extra);
+      },
+      onEnd: (cancelled) => {
+        activeDrag.current = null;
+        // The captured element, not stackRef.current: the ref can re-point
+        // to a new node mid-drag, stranding the attribute on the old one.
+        // Suppression comes off at the END of this handler: the semantic
+        // arm's unpin below must RENDER while transitions are still
+        // suppressed (see its comment).
+        const removeSuppression = () => {
+          container.removeAttribute("data-dock-resizing");
+          paperRef.current?.removeAttribute("data-dock-resizing");
+        };
+        setSnapped(false);
+        const moved = Math.abs(latest - start) > 3;
+        if (cancelled || !moved) {
+          removeSuppression();
+          // Escape OR a motionless click: full restore -- weights AND the
+          // height mode (an auto window a click briefly pinned reverts to
+          // auto; P2: layout, sizes, and modes return to pre-gesture
+          // values). The height committed is the STORED pin, never the
+          // rendered offsetHeight (heightPlan doc; the grip's
+          // startHeightCommit rule): a motionless press on a pinned window
+          // is a no-op on stored state. The detent never touches this
+          // path: cancel restores the exact pre-gesture mode/values
+          // regardless of any snap.
+          onSetWeights(startWeights);
+          setWindowHeight(heightPlan.cancelCommit);
+          return;
+        }
+        // THE SEMANTIC ARM (D56): releasing with EVERY cell of the stack at
+        // its content height (within the band) commits the window back to
+        // AUTO -- the exact inverse of pin-on-first-divider-drag, mirroring
+        // how the bottom grip's detent reverts to auto. Checked against the
+        // final committed cascade result mapped back to render px (next /
+        // scale); skipped when push-through grew the window (the scale no
+        // longer holds, and cells parked at their minimum are not "at
+        // content").
+        const n = lastNext;
+        if (
+          n !== null &&
+          lastExtra === 0 &&
+          stack.every((_, i) => {
+            const c = contentPx[i];
+            return (
+              c !== null && Math.abs(n[i] / scale - c) <= CONTENT_SNAP_BAND_PX
+            );
+          })
+        ) {
+          // Commit the unpin WHILE the transition suppressor is still on:
+          // pinned -> auto swaps the cell wrappers' flex config without
+          // moving them, and collapseAnim would ease that no-op config
+          // change into a visible wobble on the lower cell (user report).
+          // flushSync renders the commit under suppression; the attribute
+          // comes off after.
+          flushSync(() => setWindowHeight(undefined));
+        }
+        removeSuppression();
+      },
+    });
+  };
+  return (
+    <Box
+      data-floating-divider={dividerIndex}
+      {...(snapped ? { "data-dock-divider-snapped": "true" } : {})}
+      onPointerDown={onPointerDown}
+      style={{
+        position: "relative",
+        flexShrink: 0,
+        height: SPLIT_DIVIDER_PX,
+        // Splitter cursor: this divider trades height between two stacked
+        // cells (window edge grips keep ns-resize).
+        cursor: resizable ? "row-resize" : "default",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        touchAction: "none",
+        zIndex: 2,
+      }}
+    >
+      {resizable && (
+        <Box
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: -DIVIDER_OVERHANG_PX,
+            height: SPLIT_DIVIDER_PX + 2 * DIVIDER_OVERHANG_PX,
+          }}
+        />
+      )}
+      {/* Snap cue (D56): drawn by the shared dividerRuleStyle -- the SAME
+      2px primary bar as the window grip's snappedToContent cue and the
+      docked SplitDivider's rule, so the signifier cannot fork (user report:
+      a hand-rolled 1px tint read thinner than the resize cue). */}
+      <Box
+        data-dock-divider-rule=""
+        style={dividerRuleStyle(snapped, {
+          horizontal: true,
+          restOpacity: 0.5,
+        })}
+      />
+    </Box>
+  );
+}
+
+function ResizeGrip({
+  edge,
+  onPointerDown,
+}: {
+  edge:
+    | "left"
+    | "right"
+    | "top"
+    | "bottom"
+    | "top-left"
+    | "top-right"
+    | "bottom-left"
+    | "bottom-right";
+  onPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
+}) {
+  // Corners win over edges (higher z) so the diagonal cursor + combined resize
+  // take priority where they overlap.
+  // Grab areas are absolute overlays (no layout impact), biased OUTWARD past the
+  // window edge so they're easy to hit without eating into content near the
+  // border: edges ~12px (7 outside + 5 inside), corners ~18px. Corners win over
+  // edges (higher z) where they overlap.
+  const corner = edge.includes("-");
+  const position: React.CSSProperties = corner
+    ? {
+        [edge.startsWith("top") ? "top" : "bottom"]: "-7px",
+        [edge.endsWith("left") ? "left" : "right"]: "-7px",
+        width: "18px",
+        height: "18px",
+      }
+    : edge === "bottom" || edge === "top"
+      ? { left: 0, right: 0, [edge]: "-7px", height: "12px" }
+      : { top: 0, bottom: 0, [edge]: "-7px", width: "12px" };
+  const cursor = corner
+    ? edge === "bottom-left" || edge === "top-right"
+      ? "nesw-resize"
+      : "nwse-resize"
+    : edge === "bottom" || edge === "top"
+      ? "ns-resize"
+      : "ew-resize";
+  return (
+    <Box
+      data-dock-resize={edge}
+      onPointerDown={onPointerDown}
+      style={{
+        position: "absolute",
+        ...position,
+        cursor,
+        zIndex: corner ? 13 : 12,
+        touchAction: "none",
+      }}
+    />
+  );
+}

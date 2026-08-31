@@ -13,9 +13,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-viz = ["matplotlib", "viser"]
+# "viser" itself is vendored at src/camtraj_viser (patched for the segment
+# timeline's per-button color/width -- see src/camtraj_viser/CAMTRAJ_PATCH.md)
+# rather than pulled from PyPI, so its own runtime deps are listed directly.
+viz = [
+    "matplotlib",
+    "imageio>=2.0.0,<3.0.0",
+    "msgspec>=0.18.6,<1.0.0",
+    "requests>=2.0.0,<3.0.0",
+    "rich>=13.3.3,<15.0.0",
+    "tqdm>=4.0.0,<5.0.0",
+    "trimesh>=3.21.7,<5.0.0",
+    "typing-extensions>=4.0.0",
+    "websockets>=13.1,<17.0.0",
+    "zstandard>=0.20.0,<1.0.0",
+]
 io = ["pyyaml"]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["camtraj*", "camtraj_viser*"]
