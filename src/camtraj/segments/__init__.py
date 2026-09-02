@@ -1,14 +1,16 @@
 from .base import (
     EnumParamSpec,
-    OptionalGroupSpec,
+    GroupSpec,
     ParamSpec,
     SegmentBase,
     enum_param,
+    from_param_dict,
     get_enum_specs,
     get_group_specs,
     get_param_specs,
-    optional_group,
+    group,
     param,
+    to_param_dict,
 )
 from .free_form import FreeFormSegment
 from .orbit import OrbitAxis, OrbitDirection, OrbitSegment
@@ -25,14 +27,16 @@ SEGMENT_TYPES: dict[str, type[SegmentBase]] = {
 __all__ = [
     "ParamSpec",
     "EnumParamSpec",
-    "OptionalGroupSpec",
+    "GroupSpec",
     "SegmentBase",
     "get_param_specs",
     "get_enum_specs",
     "get_group_specs",
     "param",
     "enum_param",
-    "optional_group",
+    "group",
+    "to_param_dict",
+    "from_param_dict",
     "FreeFormSegment",
     "OrbitSegment",
     "OrbitAxis",

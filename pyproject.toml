@@ -30,6 +30,13 @@ viz = [
 ]
 io = ["pyyaml"]
 dev = ["pytest"]
+# Auteur demo only: actor-relative camera *framing* (see src/camtraj/auteur.py)
+# rendered against a SOMA body (github.com/NVlabs/SOMA-X) instead of the box.
+# Heavy (torch + NVIDIA Warp) and entirely optional -- the rest of camtraj
+# never imports `soma`. Uses SOMA-X's default "mhr" identity model only;
+# only ever use its default "mhr" identity model in this project -- never
+# install any of its other, non-default identity-model extras.
+auteur = ["py-soma-x", "imageio-ffmpeg"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -9,7 +9,7 @@ use -- adding a fourth (or a genuinely arbitrary) axis later needs no new math.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
@@ -18,7 +18,7 @@ from scipy.spatial.transform import Rotation
 from ..easing import Easing, apply_easing
 from ..look_at import look_at_rotation
 from ..trajectory import Trajectory
-from .base import DUTCH_MARKS, SegmentBase, enum_param, param
+from .base import DUTCH_MARKS, SegmentBase, enum_param, param, to_param_dict
 
 _DEGREES_MARKS = {30.0: "30", 45.0: "45", 60.0: "60", 90.0: "90", 180.0: "180", 270.0: "270", 360.0: "360"}
 _SPIRAL_MARKS = {-1.0: "in", -0.5: "in_0.5", -0.1: "in_0.1", 0.0: "no", 0.1: "out_0.1", 0.5: "out_0.5", 1.0: "out"}
@@ -103,13 +103,5 @@ class OrbitSegment(SegmentBase):
             times=s * (n_frames - 1),
             positions=positions,
             rotations=rotations,
-            metadata={"segment_type": "orbit", "params": _params_dict(self)},
+            metadata={"segment_type": "orbit", "params": to_param_dict(self)},
         )
-
-
-def _params_dict(segment: OrbitSegment) -> dict:
-    d = asdict(segment)
-    d["easing"] = Easing(segment.easing).value
-    d["axis"] = OrbitAxis(segment.axis).value
-    d["direction"] = OrbitDirection(segment.direction).value
-    return d

@@ -1,7 +1,42 @@
+import pytest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from camtraj.conventions import OPENGL, OPENCV, COLMAP, axis_change_matrix, convert_pose, invert_pose
+from camtraj.conventions import (
+    BLENDER,
+    COLMAP,
+    KNOWN_CONVENTIONS,
+    OPENCV,
+    OPENGL,
+    Axis,
+    Convention,
+    axis_change_matrix,
+    convert_pose,
+    invert_pose,
+)
+
+
+def test_left_handed_camera_basis_is_rejected():
+    with pytest.raises(ValueError, match="right-handed"):
+        Convention("bogus", right=Axis.PX, up=Axis.PY, forward=Axis.PZ)  # forward should be -Z, not +Z
+
+
+def test_every_known_convention_has_the_same_basis_determinant_sign():
+    # convert_pose silently assumes this (see Convention.__post_init__) --
+    # a mismatched sign would make Rotation.from_matrix silently return a
+    # reflected (mirror-image) rotation instead of raising.
+    dets = {round(float(np.linalg.det(c.basis_matrix()))) for c in KNOWN_CONVENTIONS.values()}
+    assert dets == {-1}
+
+
+def test_blender_is_identical_to_opengl():
+    rng = np.random.default_rng(2)
+    pos = rng.uniform(-5, 5, size=3)
+    rot = Rotation.from_quat(rng.normal(size=4))
+    opengl_pos, opengl_rot = convert_pose(pos, rot, OPENGL, OPENGL)
+    blender_pos, blender_rot = convert_pose(pos, rot, OPENGL, BLENDER)
+    np.testing.assert_allclose(blender_pos, opengl_pos)
+    np.testing.assert_allclose(blender_rot.as_matrix(), opengl_rot.as_matrix(), atol=1e-12)
 
 
 def test_opengl_to_opencv_is_the_well_known_yz_flip():

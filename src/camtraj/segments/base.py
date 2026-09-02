@@ -23,7 +23,7 @@ from ..trajectory import Trajectory
 
 _META_KEY = "camtraj_param"
 _ENUM_META_KEY = "camtraj_enum_param"
-_GROUP_META_KEY = "camtraj_optional_group"
+_GROUP_META_KEY = "camtraj_group"
 
 DUTCH_MARKS = {v: str(int(v)) for v in (-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0)}
 """Shared reference marks for a dutch/roll angle -- a "common modifier" in the
@@ -117,33 +117,71 @@ def get_enum_specs(segment) -> list[EnumParamSpec]:
 
 
 @dataclass(frozen=True)
-class OptionalGroupSpec:
-    """UI-facing description of one optional, toggleable sub-group of
-    parameters (e.g. "World movement", off by default) on a segment."""
+class GroupSpec:
+    """UI-facing description of one nested sub-group of parameters on a
+    segment (e.g. rotation_track's "World movement"), always present -- a
+    zero-valued instance of `group_cls` means "this group's effect is
+    disabled," the same convention `BoxMotion` uses."""
 
     name: str
     label: str
     group_cls: type
 
 
-def optional_group(*, label: str, group_cls: type) -> dataclasses.Field:
-    """Dataclass field wrapper for a nested, optional (default-off) sub-dataclass
-    of its own `param()`/`enum_param()` fields -- e.g. rotation_track's world
-    movement, hidden entirely until a checkbox turns it on. `group_cls` must be
-    a plain dataclass built the same way segments are (its own `param()` /
-    `enum_param()` fields)."""
-    spec = OptionalGroupSpec(name="", label=label, group_cls=group_cls)
-    return dataclasses.field(default=None, metadata={_GROUP_META_KEY: spec})
+def group(*, label: str, group_cls: type) -> dataclasses.Field:
+    """Dataclass field wrapper for a nested sub-dataclass of its own
+    `param()`/`enum_param()` fields -- e.g. rotation_track's world movement.
+    Always present (never `None`); the app renders it as its own
+    collapsed-by-default folder with a dedicated reset button, no on/off
+    checkbox -- a zero-valued `group_cls()` already means "no effect."
+    `group_cls` must be a plain dataclass built the same way segments are."""
+    spec = GroupSpec(name="", label=label, group_cls=group_cls)
+    return dataclasses.field(default_factory=group_cls, metadata={_GROUP_META_KEY: spec})
 
 
-def get_group_specs(segment) -> list[OptionalGroupSpec]:
-    """Introspect a segment instance or class, returning its `optional_group()` fields' specs."""
+def get_group_specs(segment) -> list[GroupSpec]:
+    """Introspect a segment instance or class, returning its `group()` fields' specs."""
     specs = []
     for f in dataclasses.fields(segment):
         spec = f.metadata.get(_GROUP_META_KEY)
         if spec is not None:
             specs.append(dataclasses.replace(spec, name=f.name))
     return specs
+
+
+def to_param_dict(instance) -> dict:
+    """Recursively convert a `param()`/`enum_param()`/`group()` dataclass (a
+    segment, `BoxMotion`, or a nested group like `WorldMove`) into a plain
+    JSON-safe dict: enum fields become their `.value`, nested dataclass
+    fields (`group()`) recurse the same way. Used both for a `Trajectory`'s
+    own `metadata["params"]` provenance and for `camtraj.recipe`'s save/load."""
+    result = {}
+    for f in dataclasses.fields(instance):
+        value = getattr(instance, f.name)
+        if isinstance(value, Enum):
+            result[f.name] = value.value
+        elif dataclasses.is_dataclass(value):
+            result[f.name] = to_param_dict(value)
+        else:
+            result[f.name] = value
+    return result
+
+
+def from_param_dict(cls: type, data: dict):
+    """Inverse of `to_param_dict`: reconstruct a `cls` instance from a dict,
+    using `cls`'s own `enum_param()`/`group()` field metadata to know which
+    values need converting back (a plain dict can't carry that on its own)."""
+    enum_classes = {spec.name: spec.enum_cls for spec in get_enum_specs(cls)}
+    group_classes = {spec.name: spec.group_cls for spec in get_group_specs(cls)}
+    kwargs = {}
+    for key, value in data.items():
+        if key in enum_classes:
+            kwargs[key] = enum_classes[key](value)
+        elif key in group_classes:
+            kwargs[key] = from_param_dict(group_classes[key], value)
+        else:
+            kwargs[key] = value
+    return cls(**kwargs)
 
 
 class SegmentBase(ABC):

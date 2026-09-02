@@ -8,7 +8,7 @@ one continuous `damping` slider, with the old tiers kept as marks.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation
 
 from ..look_at import look_at_rotation
 from ..trajectory import Trajectory
-from .base import DUTCH_MARKS, SegmentBase, enum_param, param
+from .base import DUTCH_MARKS, SegmentBase, enum_param, param, to_param_dict
 
 _DAMPING_MARKS = {1.0: "hard", 0.5: "soft", 0.15: "lazy"}
 _AMP_MARKS = {0.0: "locked", 0.5: "0.5", 0.8: "0.8", 1.0: "normal", 1.2: "1.2", 1.5: "1.5"}
@@ -92,11 +92,5 @@ class TailSegment(SegmentBase):
             times=np.arange(n_frames, dtype=np.float64),
             positions=positions,
             rotations=rotations,
-            metadata={"segment_type": "tail", "params": _params_dict(self)},
+            metadata={"segment_type": "tail", "params": to_param_dict(self)},
         )
-
-
-def _params_dict(segment: TailSegment) -> dict:
-    d = asdict(segment)
-    d["look_mode"] = LookMode(segment.look_mode).value
-    return d

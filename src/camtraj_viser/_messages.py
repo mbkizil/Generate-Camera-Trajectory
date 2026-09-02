@@ -2603,6 +2603,77 @@ class CommandTriggerMessage(Message, include_in_scene_serialization=False):
 
 
 @dataclasses.dataclass
+class SegmentTimelineMessage(Message, include_in_scene_serialization=False):
+    """(camtraj patch) Message from server->client that fully replaces the
+    segment-timeline overlay: a small, non-draggable, chromeless strip of
+    colored boxes centered at the top of the viewport, rendered outside the
+    normal GUI panel/dock system. There's always exactly one timeline, so
+    this is a full replace, not an entity-lifecycle create/update/remove."""
+
+    segments: Tuple[Tuple[str, str, Tuple[int, int, int], float, bool], ...]
+    """(short_label, long_label, color, extent, removable) per segment box,
+    left to right. `extent` is a normalized 0-1 value (not pixels or a
+    flex-grow weight directly) driving both the box's width and which of the
+    two labels is shown, so the box visibly grows in both size and text at
+    once as `extent` increases."""
+    selected: int
+
+    @override
+    def redundancy_key(self) -> str:
+        return type(self).__name__
+
+
+@dataclasses.dataclass
+class SegmentTimelineActionMessage(Message, include_in_scene_serialization=False):
+    """(camtraj patch) Message from client->server: the user clicked a
+    segment box, its embedded "x" (remove), or the trailing "+" (add)."""
+
+    action: Literal["select", "add", "remove"]
+    index: int
+
+
+@dataclasses.dataclass
+class KeyframeTimelineMessage(Message, include_in_scene_serialization=False):
+    """(camtraj patch) Message from server->client that fully replaces the
+    keyframe-timeline overlay: a fixed-width bar spanning the whole
+    trajectory, with draggable, click-to-add/remove keyframe "pins" plus an
+    embedded total-frame-count field. There's always exactly one timeline,
+    so this is a full replace, not an entity-lifecycle create/update/remove."""
+
+    keyframes: Tuple[Tuple[str, int], ...]
+    """(label, frame) per keyframe, sorted by frame ascending -- the client
+    never reorders these itself, only the server does (after a drag/add)."""
+    selected: int
+    total_frames: int
+    total_frames_min: int
+    total_frames_max: int
+
+    @override
+    def redundancy_key(self) -> str:
+        return type(self).__name__
+
+
+@dataclasses.dataclass
+class KeyframeTimelineActionMessage(Message, include_in_scene_serialization=False):
+    """(camtraj patch) Message from client->server: select/add/remove/drag a
+    keyframe pin, or edit the total-frame-count field.
+
+    - "select": `index` is the clicked keyframe's position; `frame` unused.
+    - "add": `frame` is where the bar was clicked; `index` unused (the
+      server decides sort position).
+    - "remove": `index` is the keyframe to remove; `frame` unused.
+    - "move": `index` is the dragged keyframe, `frame` its new (client-side
+      already-clamped) position -- the server re-clamps authoritatively and
+      always re-broadcasts the corrected `KeyframeTimelineMessage`.
+    - "set_total_frames": `frame` is the new total; `index` unused.
+    """
+
+    action: Literal["select", "add", "remove", "move", "set_total_frames"]
+    index: int
+    frame: int
+
+
+@dataclasses.dataclass
 class LocalStorageSetItemMessage(Message, include_in_scene_serialization=False):
     """Set a key in the client's localStorage."""
 

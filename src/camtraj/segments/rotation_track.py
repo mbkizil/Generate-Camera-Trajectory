@@ -10,7 +10,7 @@ two-halves behavior).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
@@ -19,7 +19,7 @@ from scipy.spatial.transform import Rotation
 from ..easing import Easing, apply_easing
 from ..look_at import look_at_rotation
 from ..trajectory import Trajectory
-from .base import DUTCH_MARKS, SegmentBase, enum_param, optional_group, param
+from .base import DUTCH_MARKS, SegmentBase, enum_param, group, param, to_param_dict
 
 _PUSH_MARKS = {-0.5: "out_0.5", -0.3: "out_0.3", -0.1: "out_0.1", 0.0: "no", 0.1: "in_0.1", 0.3: "in_0.3", 0.5: "in_0.5"}
 _WORLD_UP = np.array([0.0, 1.0, 0.0])
@@ -43,8 +43,9 @@ class WorldMove:
 @dataclass
 class RotationTrackSegment(SegmentBase):
     """Continuously re-aims at the box, optionally translating (a `WorldMove`,
-    off by default -- toggle it on to truck/pedestal/dolly while re-aiming)
-    and/or pushing in/out along the current sightline.
+    zero by default -- a zero-valued one just means "doesn't move," the same
+    convention `BoxMotion` uses) and/or pushing in/out along the current
+    sightline.
 
     `rot_axis` restricts which rotation axes are used to track the box:
     `pan` locks the camera level and only yaws; `tilt` freezes the camera's
@@ -58,7 +59,7 @@ class RotationTrackSegment(SegmentBase):
 
     frames: int = param(label="Frames", min=21, max=300, default=61, step=4, unit="frames")
 
-    world_move: WorldMove | None = optional_group(label="World movement", group_cls=WorldMove)
+    world_move: WorldMove = group(label="World movement", group_cls=WorldMove)
     push: float = param(label="Push (- out / + in)", min=-0.5, max=0.5, default=0.0, marks=_PUSH_MARKS)
     rot_axis: RotAxis = enum_param(label="Rotation axis", enum_cls=RotAxis, default=RotAxis.FULL)
     dutch_deg: float = param(label="Dutch / roll", min=-45.0, max=45.0, default=0.0, marks=DUTCH_MARKS, unit="deg")
@@ -74,8 +75,7 @@ class RotationTrackSegment(SegmentBase):
         s = np.linspace(0.0, 1.0, n_frames)
         s_eased = apply_easing(s, self.easing, self.easing_strength)
 
-        move = self.world_move or WorldMove(move_x=0.0, move_y=0.0, move_z=0.0)
-        world_delta = np.array([move.move_x, move.move_y, move.move_z])
+        world_delta = np.array([self.world_move.move_x, self.world_move.move_y, self.world_move.move_z])
         base_positions = start_position[None, :] + s_eased[:, None] * world_delta[None, :]
 
         to_target = target_positions - base_positions
@@ -95,7 +95,7 @@ class RotationTrackSegment(SegmentBase):
             times=s * (n_frames - 1),
             positions=positions,
             rotations=rotations,
-            metadata={"segment_type": "rotation_track", "params": _params_dict(self)},
+            metadata={"segment_type": "rotation_track", "params": to_param_dict(self)},
         )
 
 
@@ -126,10 +126,3 @@ def _aim_forward_vectors(positions: np.ndarray, target_positions: np.ndarray, ro
     aimed_norms = np.linalg.norm(aimed, axis=1, keepdims=True)
     fallback = np.tile(heading, (len(aimed), 1))
     return np.divide(aimed, aimed_norms, out=fallback, where=aimed_norms > 1e-9)
-
-
-def _params_dict(segment: RotationTrackSegment) -> dict:
-    d = asdict(segment)
-    d["easing"] = Easing(segment.easing).value
-    d["rot_axis"] = RotAxis(segment.rot_axis).value
-    return d

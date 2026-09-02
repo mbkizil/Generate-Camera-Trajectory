@@ -106,6 +106,8 @@ function useMessageHandler() {
   const addCommand = viewer.guiActions.addCommand;
   const updateCommand = viewer.guiActions.updateCommand;
   const removeCommand = viewer.guiActions.removeCommand;
+  const setSegmentTimeline = viewer.guiActions.setSegmentTimeline;
+  const setKeyframeTimeline = viewer.guiActions.setKeyframeTimeline;
 
   // Same as addSceneNode, but make a parent in the form of a dummy coordinate
   // frame if it doesn't exist yet.
@@ -501,6 +503,18 @@ function useMessageHandler() {
       }
       case "RemoveCommandMessage": {
         removeCommand(message.uuid);
+        return;
+      }
+
+      // (camtraj patch) Segment-timeline overlay: a single, wholesale replace.
+      case "SegmentTimelineMessage": {
+        setSegmentTimeline(message);
+        return;
+      }
+
+      // (camtraj patch) Keyframe-timeline overlay: a single, wholesale replace.
+      case "KeyframeTimelineMessage": {
+        setKeyframeTimeline(message);
         return;
       }
 

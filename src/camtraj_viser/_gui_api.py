@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Protocol,
     Sequence,
     Tuple,
@@ -364,6 +365,24 @@ class GuiApi:
         self._websock_interface.register_handler(
             _messages.CommandTriggerMessage, self._handle_command_trigger
         )
+        # (camtraj patch) segment-timeline overlay: a single global callback,
+        # since there's always exactly one timeline (see set_segment_timeline).
+        self._segment_timeline_action_cb: (
+            Callable[[str, int], None] | None
+        ) = None
+        self._websock_interface.register_handler(
+            _messages.SegmentTimelineActionMessage,
+            self._handle_segment_timeline_action,
+        )
+        # (camtraj patch) keyframe-timeline overlay: same single-global-
+        # callback pattern (see set_keyframe_timeline).
+        self._keyframe_timeline_action_cb: (
+            Callable[[str, int, int], None] | None
+        ) = None
+        self._websock_interface.register_handler(
+            _messages.KeyframeTimelineActionMessage,
+            self._handle_keyframe_timeline_action,
+        )
 
     def _resolve_client(self, client_id: ClientId) -> ClientHandle | None:
         """Resolve the ClientHandle for a given client_id. Returns None when
@@ -691,6 +710,110 @@ class GuiApi:
                 self._thread_executor.submit(
                     cb, CommandEvent(client, client_id, handle)
                 ).add_done_callback(print_threadpool_errors)
+
+    async def _handle_segment_timeline_action(
+        self, client_id: ClientId, message: _messages.SegmentTimelineActionMessage
+    ) -> None:
+        """(camtraj patch) Callback for clicks on the segment-timeline overlay."""
+        if self._segment_timeline_action_cb is None:
+            return
+        self._thread_executor.submit(
+            self._segment_timeline_action_cb, message.action, message.index
+        ).add_done_callback(print_threadpool_errors)
+
+    def set_segment_timeline(
+        self,
+        segments: Sequence[tuple[str, str, tuple[int, int, int], float, bool]],
+        selected: int,
+    ) -> None:
+        """(camtraj patch) Set/replace the segment-timeline overlay: a small,
+        non-draggable, chromeless strip of colored boxes centered at the top
+        of the viewport, rendered outside the normal GUI panel/dock system.
+
+        There's always exactly one timeline, so calling this again fully
+        replaces the prior state (it's not an incremental add/update/remove
+        API) -- callers should pass the complete, current list every time.
+
+        Args:
+            segments: One ``(short_label, long_label, color, extent,
+                removable)`` tuple per segment box, left to right. ``extent``
+                is a normalized 0-1 value: the box shows ``short_label`` and
+                is narrow near 0, and grows both wider and into
+                ``long_label`` as it approaches 1. ``removable`` controls
+                whether that segment renders an embedded "x" button.
+            selected: Index of the currently-selected segment (rendered
+                visually distinct).
+        """
+        self._websock_interface.queue_message(
+            _messages.SegmentTimelineMessage(
+                segments=tuple(segments), selected=selected
+            )
+        )
+
+    def on_segment_timeline_action(
+        self, callback: Callable[[Literal["select", "add", "remove"], int], None]
+    ) -> None:
+        """(camtraj patch) Register a callback for the segment-timeline
+        overlay: fires with ``(action, index)`` when the user selects a
+        segment, clicks its "x", or clicks the trailing "+"."""
+        self._segment_timeline_action_cb = callback
+
+    async def _handle_keyframe_timeline_action(
+        self, client_id: ClientId, message: _messages.KeyframeTimelineActionMessage
+    ) -> None:
+        """(camtraj patch) Callback for interactions with the keyframe-timeline overlay."""
+        if self._keyframe_timeline_action_cb is None:
+            return
+        self._thread_executor.submit(
+            self._keyframe_timeline_action_cb, message.action, message.index, message.frame
+        ).add_done_callback(print_threadpool_errors)
+
+    def set_keyframe_timeline(
+        self,
+        keyframes: Sequence[tuple[str, int]],
+        selected: int,
+        total_frames: int,
+        total_frames_min: int,
+        total_frames_max: int,
+    ) -> None:
+        """(camtraj patch) Set/replace the keyframe-timeline overlay: a
+        fixed-width bar spanning the whole trajectory, with draggable,
+        click-to-add/remove keyframe "pins" plus an embedded
+        total-frame-count field.
+
+        There's always exactly one timeline, so calling this again fully
+        replaces the prior state -- callers should pass the complete,
+        current list every time (sorted by frame ascending).
+
+        Args:
+            keyframes: One ``(label, frame)`` tuple per keyframe, sorted by
+                frame ascending.
+            selected: Index (into ``keyframes``) of the currently-selected one.
+            total_frames: Current total length of the trajectory, in frames.
+            total_frames_min: Minimum value accepted by the embedded
+                total-frame-count field.
+            total_frames_max: Maximum value accepted by the embedded
+                total-frame-count field.
+        """
+        self._websock_interface.queue_message(
+            _messages.KeyframeTimelineMessage(
+                keyframes=tuple(keyframes),
+                selected=selected,
+                total_frames=total_frames,
+                total_frames_min=total_frames_min,
+                total_frames_max=total_frames_max,
+            )
+        )
+
+    def on_keyframe_timeline_action(
+        self,
+        callback: Callable[[Literal["select", "add", "remove", "move", "set_total_frames"], int, int], None],
+    ) -> None:
+        """(camtraj patch) Register a callback for the keyframe-timeline
+        overlay: fires with ``(action, index, frame)`` -- see
+        ``KeyframeTimelineActionMessage`` for what ``index``/``frame`` mean
+        per action."""
+        self._keyframe_timeline_action_cb = callback
 
     def _get_container_uuid(self) -> str:
         """Get container ID associated with the current thread.

@@ -12,7 +12,9 @@ import {
   GuiModalMessage,
   GuiPanelMessage,
   GuiSetPanelPositionMessage,
+  KeyframeTimelineMessage,
   RegisterCommandMessage,
+  SegmentTimelineMessage,
   ThemeConfigurationMessage,
 } from "../WebsocketMessages";
 
@@ -110,6 +112,13 @@ export interface GuiState {
   };
   /** Registered command palette actions, keyed by UUID. */
   commands: { [uuid: string]: RegisterCommandMessage };
+  /** (camtraj patch) Current segment-timeline overlay state, or null if the
+   * server hasn't sent one. Always fully replaced (there's only ever one
+   * timeline), unlike the entity-keyed maps above. */
+  segmentTimeline: SegmentTimelineMessage | null;
+  /** (camtraj patch) Current keyframe-timeline overlay state, or null if the
+   * server hasn't sent one. Same full-replace convention as segmentTimeline. */
+  keyframeTimeline: KeyframeTimelineMessage | null;
   /** Client-owned placement state, keyed by panel uuid (and CONTROL_PANEL_ID
    * for the main panel). Built up by the four write-only `GuiSetPanel*`
    * messages; the dock applies whatever fields are present. */
@@ -176,6 +185,10 @@ export interface GuiActions {
   addCommand: (command: RegisterCommandMessage) => void;
   updateCommand: (uuid: string, updates: { [key: string]: any }) => void;
   removeCommand: (uuid: string) => void;
+  /** (camtraj patch) Replace the segment-timeline overlay state wholesale. */
+  setSegmentTimeline: (message: SegmentTimelineMessage) => void;
+  /** (camtraj patch) Replace the keyframe-timeline overlay state wholesale. */
+  setKeyframeTimeline: (message: KeyframeTimelineMessage) => void;
   setPanelPosition: (
     uuid: string,
     position: GuiSetPanelPositionMessage["position"],
@@ -244,6 +257,8 @@ const cleanGuiState: GuiState = {
   dirtyFormUuids: {},
   uploadsInProgress: {},
   commands: {},
+  segmentTimeline: null,
+  keyframeTimeline: null,
   panelPlacement: {},
   panelLayoutTracking: {},
   layoutResetNonce: 0,
@@ -557,6 +572,12 @@ export function useGuiState(initialServer: string) {
           delete next[uuid];
           return { commands: next };
         });
+      },
+      setSegmentTimeline: (message) => {
+        store.set({ segmentTimeline: message });
+      },
+      setKeyframeTimeline: (message) => {
+        store.set({ keyframeTimeline: message });
       },
       // The four write-only GuiSetPanel* messages each merge their single AXIS
       // here, with the sending command's (counter, runId) stamp. One factory,

@@ -2145,6 +2145,50 @@ export interface CommandTriggerMessage {
   type: "CommandTriggerMessage";
   uuid: string;
 }
+/** (camtraj patch) Message from server->client that fully replaces the
+ * segment-timeline overlay: a small, non-draggable, chromeless strip of
+ * colored boxes centered at the top of the viewport, rendered outside the
+ * normal GUI panel/dock system.
+ */
+export interface SegmentTimelineMessage {
+  type: "SegmentTimelineMessage";
+  /** (short_label, long_label, color, extent, removable) per segment box,
+   * left to right. `extent` is normalized 0-1: drives both the box's width
+   * and which label is shown. */
+  segments: [string, string, [number, number, number], number, boolean][];
+  selected: number;
+}
+/** (camtraj patch) Message from client->server: the user clicked a segment
+ * box, its embedded "x" (remove), or the trailing "+" (add).
+ */
+export interface SegmentTimelineActionMessage {
+  type: "SegmentTimelineActionMessage";
+  action: "select" | "add" | "remove";
+  index: number;
+}
+/** (camtraj patch) Message from server->client that fully replaces the
+ * keyframe-timeline overlay: a fixed-width bar spanning the whole
+ * trajectory, with draggable, click-to-add/remove keyframe "pins" plus an
+ * embedded total-frame-count field.
+ */
+export interface KeyframeTimelineMessage {
+  type: "KeyframeTimelineMessage";
+  /** (label, frame) per keyframe, sorted by frame ascending. */
+  keyframes: [string, number][];
+  selected: number;
+  total_frames: number;
+  total_frames_min: number;
+  total_frames_max: number;
+}
+/** (camtraj patch) Message from client->server: select/add/remove/drag a
+ * keyframe pin, or edit the total-frame-count field.
+ */
+export interface KeyframeTimelineActionMessage {
+  type: "KeyframeTimelineActionMessage";
+  action: "select" | "add" | "remove" | "move" | "set_total_frames";
+  index: number;
+  frame: number;
+}
 /** Set a key in the client's localStorage.
  *
  * (automatically generated)
@@ -2304,6 +2348,10 @@ export type Message =
   | CommandUpdateMessage
   | RemoveCommandMessage
   | CommandTriggerMessage
+  | SegmentTimelineMessage
+  | SegmentTimelineActionMessage
+  | KeyframeTimelineMessage
+  | KeyframeTimelineActionMessage
   | LocalStorageSetItemMessage
   | LocalStorageRemoveItemMessage
   | LocalStorageClearMessage

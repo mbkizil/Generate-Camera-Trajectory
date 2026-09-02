@@ -8,14 +8,14 @@ This generalizes the original DSL's 7-level categorical translate per axis
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from ..easing import Easing, apply_easing
 from ..trajectory import Trajectory
-from .base import SegmentBase, enum_param, param
+from .base import SegmentBase, enum_param, param, to_param_dict
 
 _LATERAL_MARKS = {-1.0: "far_left", -2 / 3: "left", -1 / 3: "near_left", 0.0: "no",
                    1 / 3: "near_right", 2 / 3: "right", 1.0: "far_right"}
@@ -83,11 +83,5 @@ class FreeFormSegment(SegmentBase):
             times=s * (n_frames - 1),  # frame-index units; the app layer maps this to real seconds
             positions=positions,
             rotations=rotations,
-            metadata={"segment_type": "free_form", "params": _params_dict(self)},
+            metadata={"segment_type": "free_form", "params": to_param_dict(self)},
         )
-
-
-def _params_dict(segment: FreeFormSegment) -> dict:
-    d = asdict(segment)
-    d["easing"] = Easing(segment.easing).value
-    return d

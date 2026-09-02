@@ -8,4 +8,9 @@ outputs/**
 .venv/
 *.mp4
 *.png
-!docs/**/*.png
+!outputs/camtraj.mp4
+!outputs/auteur.png
+!outputs/main.png
+!outputs/var1.png
+!outputs/var2.png
+CLAUDE.md

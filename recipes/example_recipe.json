@@ -1,0 +1,91 @@
+{
+  "camtraj_recipe_version": 1,
+  "segments": [
+    {
+      "type": "free_form",
+      "params": {
+        "frames": 21,
+        "lateral": 0.0,
+        "vertical": 0.0,
+        "depth": 0.28,
+        "distance_scale": 6.0,
+        "yaw_deg": 0.0,
+        "pitch_deg": 0.0,
+        "roll_deg": 0.0,
+        "easing": "linear",
+        "easing_strength": 0.5
+      }
+    },
+    {
+      "type": "orbit",
+      "params": {
+        "frames": 93,
+        "axis": "y",
+        "direction": "cw",
+        "degrees": 90.0,
+        "spiral": 0.0,
+        "dutch_deg": 0.0,
+        "easing": "linear",
+        "easing_strength": 0.5
+      }
+    },
+    {
+      "type": "orbit",
+      "params": {
+        "frames": 33,
+        "axis": "z",
+        "direction": "cw",
+        "degrees": 36.95,
+        "spiral": -0.24,
+        "dutch_deg": 0.0,
+        "easing": "linear",
+        "easing_strength": 0.5
+      }
+    },
+    {
+      "type": "free_form",
+      "params": {
+        "frames": 69,
+        "lateral": 0.0,
+        "vertical": 0.0,
+        "depth": -0.24,
+        "distance_scale": 6.0,
+        "yaw_deg": 0.0,
+        "pitch_deg": 0.0,
+        "roll_deg": 0.0,
+        "easing": "linear",
+        "easing_strength": 0.5
+      }
+    }
+  ],
+  "box_motions": [
+    {
+      "delta_x": 0.0,
+      "delta_y": 0.0,
+      "delta_z": 0.0,
+      "easing": "linear",
+      "easing_strength": 0.5
+    },
+    {
+      "delta_x": 0.0,
+      "delta_y": 0.0,
+      "delta_z": 0.0,
+      "easing": "linear",
+      "easing_strength": 0.5
+    },
+    {
+      "delta_x": 0.0,
+      "delta_y": 0.0,
+      "delta_z": 0.0,
+      "easing": "linear",
+      "easing_strength": 0.5
+    },
+    {
+      "delta_x": 0.0,
+      "delta_y": 0.0,
+      "delta_z": 0.0,
+      "easing": "linear",
+      "easing_strength": 0.5
+    }
+  ]
+}

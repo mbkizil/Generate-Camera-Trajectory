@@ -15,9 +15,9 @@ def test_frame_zero_matches_start_position():
     np.testing.assert_allclose(traj.positions[0], [3.0, 1.0, -2.0], atol=1e-9)
 
 
-def test_world_move_none_by_default_camera_stays_put_with_no_push():
+def test_world_move_zero_by_default_camera_stays_put_with_no_push():
     traj = _build(push=0.0)
-    assert traj.metadata["params"]["world_move"] is None
+    assert traj.metadata["params"]["world_move"] == {"move_x": 0.0, "move_y": 0.0, "move_z": 0.0}
     np.testing.assert_allclose(traj.positions - traj.positions[0], 0.0, atol=1e-9)
 
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import io
+import json
 import threading
 import time
 from typing import Optional
@@ -18,12 +20,14 @@ from typing import Optional
 import numpy as np
 import camtraj_viser as viser
 
-from camtraj import BoxMotion, look_at_rotation, sequence
+from camtraj import BoxMotion, look_at_rotation, recipe_from_dict, recipe_to_dict, sequence
+from camtraj.conventions import KNOWN_CONVENTIONS, OPENGL, convert_pose
 from camtraj.segments import SEGMENT_TYPES, FreeFormSegment
 from camtraj.trajectory import Trajectory
 
 from ._shared import viz
-from ._shared.param_forms import add_enum_dropdowns, add_optional_groups, add_param_sliders
+from ._shared.example_recipe import EXAMPLE_RECIPE_PATH
+from ._shared.param_forms import add_enum_dropdowns, add_groups, add_param_sliders
 
 _SEGMENT_TYPE_NAMES = {cls: name for name, cls in SEGMENT_TYPES.items()}
 
@@ -48,7 +52,8 @@ def _frame_text(t: float, duration: float) -> str:
 
 def main(port: int = 8080, share: bool = True) -> None:
     server = viser.ViserServer(port=port)
-    server.gui.configure_theme(brand_color=(190, 110, 40))  # slightly dark orange accent
+    server.gui.configure_theme(brand_color=(70, 150, 220))  # sky blue accent -- the main panel's own color,
+    # independent of the segment timeline's orange (which sets its own explicit colors, unrelated to this)
     viz.add_ground(server)
     box_handle = viz.add_reference_box(server)
 
@@ -89,7 +94,6 @@ def main(port: int = 8080, share: bool = True) -> None:
     pov_image: Optional[viser.GuiImageHandle] = None
     pov_status: Optional[viser.GuiMarkdownHandle] = None
     pov_busy = [False]
-    timeline_group: Optional[viser.GuiButtonGroupHandle] = None
 
     def update_camera_and_box(t: float) -> None:
         viz.update_current_camera(current_cam, state["trajectory"], t)
@@ -120,30 +124,30 @@ def main(port: int = 8080, share: bool = True) -> None:
         update_camera_and_box(state["t"])
         frame_readout.content = _frame_text(state["t"], trajectory.duration)
 
-    # --- Sequence timeline: a floating bar docked near the top, not a sidebar
-    # folder -- short vertically, wide horizontally, showing every segment
-    # side by side with its own length. ---------------------------------------
+    # --- Sequence timeline: a standalone overlay, not a GUI panel -----------
     #
     # This app vendors a patched build of viser (src/camtraj_viser) that adds
-    # per-option `colors` and `sizes` to add_button_group -- real proportional
-    # width (sqrt-scaled, so it's not linear) and a real orange fill, with the
-    # selected segment rendered solid/filled and others as a lighter tint (see
-    # camtraj_viser/client/src/components/ButtonGroup.tsx). [+] / [x] ride in
-    # the same row as trailing, uncolored, compact options, so add/select/
-    # remove all live in one strip. Remove always targets whichever segment is
-    # currently selected (there's no embedded per-box close icon).
+    # a dedicated `set_segment_timeline`/`on_segment_timeline_action` API
+    # (see camtraj_viser/client/src/SegmentTimeline.tsx): a small, chromeless,
+    # always-centered row of colored boxes with an embedded "x" per removable
+    # segment, rendered outside the normal panel/dock system entirely (which
+    # always draws a header/background around its content, and floats at a
+    # fixed pixel position rather than staying centered). Segment 1 is
+    # permanently anchored -- never removable -- which also means the
+    # sequence can never be emptied out from under it.
 
-    _ADD_TOKEN = "+"
-    _REMOVE_TOKEN = "x"
-    _SEGMENT_COLOR = (190, 110, 40)  # matches the app's brand_color accent
+    _SEGMENT_COLOR = (190, 110, 40)  # slightly dark orange, deliberately distinct
+    # from the main panel's own sky-blue brand_color -- the two accents are
+    # unrelated (this one is sent explicitly per segment, not derived from theme)
 
-    def _segment_size(i: int) -> float:
+    def _segment_extent(i: int) -> float:
+        """0-1 normalized position of this segment's frame count between the
+        `frames` slider's actual min/max (21/300, shared by every primitive),
+        sqrt-scaled so short segments aren't visually crushed to nothing.
+        Drives both the timeline box's width and label text (see
+        SegmentTimeline.tsx) -- both grow together as this approaches 1."""
         frames = state["segments"][i].frames
-        return 1.0 + min((max(frames - 21, 0) / 279.0) ** 0.5, 1.0) * 2.0
-
-    timeline_panel = server.gui.add_panel()
-    with timeline_panel.add_tab("Sequence") as timeline_tab:
-        pass
+        return min((max(frames - 21, 0) / 279.0) ** 0.5, 1.0)
 
     def select_segment(idx: int) -> None:
         state["selected"] = idx
@@ -152,48 +156,33 @@ def main(port: int = 8080, share: bool = True) -> None:
 
     def rebuild_timeline() -> None:
         """Full rebuild: segment count, selection, and/or frame counts may have changed."""
-        nonlocal timeline_group
-        if timeline_group is not None:
-            timeline_group.remove()
-        with timeline_tab:
-            n = len(state["segments"])
-            labels = [str(i + 1) for i in range(n)]
-            options = labels + [_ADD_TOKEN, _REMOVE_TOKEN]
-            colors = [_SEGMENT_COLOR] * n + [None, None]
-            sizes = [_segment_size(i) for i in range(n)] + [0.5, 0.5]
-            timeline_group = server.gui.add_button_group("", options=options, colors=colors, sizes=sizes)
-            timeline_group.value = labels[state["selected"]]
+        n = len(state["segments"])
+        segments = [
+            (f"seg {i + 1}", f"segment {i + 1}", _SEGMENT_COLOR, _segment_extent(i), i != 0) for i in range(n)
+        ]
+        server.gui.set_segment_timeline(segments, state["selected"])
 
-            @timeline_group.on_click
-            def _(_) -> None:
-                value = timeline_group.value
-                if value == _ADD_TOKEN:
-                    if len(state["segments"]) >= MAX_SEGMENTS:
-                        rebuild_timeline()  # snap the button group back (it still "clicked")
-                        return
-                    state["segments"].append(FreeFormSegment())
-                    state["box_motions"].append(BoxMotion())
-                    select_segment(len(state["segments"]) - 1)
-                    rebuild_and_redraw()
-                elif value == _REMOVE_TOKEN:
-                    if len(state["segments"]) <= 1:
-                        rebuild_timeline()
-                        return
-                    idx = state["selected"]
-                    state["segments"].pop(idx)
-                    state["box_motions"].pop(idx)
-                    select_segment(min(idx, len(state["segments"]) - 1))
-                    rebuild_and_redraw()
-                else:
-                    idx = int(value) - 1
-                    if idx != state["selected"]:
-                        select_segment(idx)
+    def _on_timeline_action(action, index: int) -> None:
+        if action == "add":
+            if len(state["segments"]) >= MAX_SEGMENTS:
+                return
+            state["segments"].append(FreeFormSegment())
+            state["box_motions"].append(BoxMotion())
+            select_segment(len(state["segments"]) - 1)
+            rebuild_and_redraw()
+        elif action == "remove":
+            if index == 0 or index >= len(state["segments"]):
+                return
+            state["segments"].pop(index)
+            state["box_motions"].pop(index)
+            select_segment(min(index, len(state["segments"]) - 1))
+            rebuild_and_redraw()
+        else:  # "select"
+            if index != state["selected"]:
+                select_segment(index)
 
+    server.gui.on_segment_timeline_action(_on_timeline_action)
     rebuild_timeline()
-    # Roughly centers a compact single-row bar against a typical desktop canvas
-    # (viser has no server-side way to know the actual viewport width to center
-    # exactly -- nudge x/width here if it looks off).
-    timeline_panel.float(x=280, y=10, width=340, height=64)
 
     # --- Segment: the selected segment's own properties ----------------------
 
@@ -289,10 +278,9 @@ def main(port: int = 8080, share: bool = True) -> None:
                     rebuild_segment_param_ui()
                     rebuild_and_redraw()
 
-            # Primitive-specific optional groups (e.g. rotation_track's world
-            # movement) are added *last*: each one's own checkbox toggle tears
-            # down "everything after it" in segment_param_handles, which is
-            # only safe when nothing else follows.
+            # Primitive-specific groups (e.g. rotation_track's world movement)
+            # -- always present, no on/off checkbox, own reset button. Same
+            # collapsed-by-default treatment as box motion above.
             def get_group_value(name: str):
                 return getattr(state["segments"][state["selected"]], name)
 
@@ -301,7 +289,7 @@ def main(port: int = 8080, share: bool = True) -> None:
                 state["segments"][idx] = dataclasses.replace(state["segments"][idx], **{name: value})
                 rebuild_and_redraw()
 
-            add_optional_groups(server, selected_segment, segment_param_handles, get_group_value, set_group_value)
+            add_groups(server, selected_segment, segment_param_handles, get_group_value, set_group_value, rebuild_segment_param_ui)
 
     rebuild_segment_param_ui()  # populate for the initial single segment
 
@@ -349,7 +337,7 @@ def main(port: int = 8080, share: bool = True) -> None:
 
     pov_state = {"frames": [], "duration": 0.0}
 
-    with server.gui.add_folder("Camera POV"):
+    with server.gui.add_folder("Camera POV", expand_by_default=False):
         pov_image = server.gui.add_image(np.full((*POV_SIZE, 3), 200, dtype=np.uint8), label="Camera view")
         pov_status = server.gui.add_markdown("Not rendered yet.")
         pov_play_button = server.gui.add_button("Render & Play POV", icon=viser.Icon.PLAYER_PLAY)
@@ -433,6 +421,97 @@ def main(port: int = 8080, share: bool = True) -> None:
         pov_state["frames"] = frames
         pov_state["duration"] = trajectory.duration
         play_pov_frames()
+
+    # --- Recipe: save/load the segment + box-motion definitions themselves ---
+    # As opposed to Export below, which bakes the *current* trajectory into
+    # numeric arrays, a recipe is the editable design itself (segment types +
+    # their param values + box motions) -- what you'd persist across
+    # sessions, share with a teammate, or eventually randomize around for
+    # batch generation. See `camtraj.recipe`.
+
+    with server.gui.add_folder("Recipe"):
+        save_recipe_button = server.gui.add_button("Save recipe (.json)", icon=viser.Icon.DEVICE_FLOPPY)
+        example_recipe_button = server.gui.add_button("Load example recipe", icon=viser.Icon.SPARKLES)
+        load_recipe_button = server.gui.add_upload_button(
+            "Load recipe (.json)", icon=viser.Icon.UPLOAD, mime_type=".json,application/json"
+        )
+        recipe_status = server.gui.add_markdown("")
+
+        @save_recipe_button.on_click
+        def _(event: viser.GuiEvent) -> None:
+            data = recipe_to_dict(state["segments"], state["box_motions"])
+            content = json.dumps(data, indent=2).encode("utf-8")
+            target = event.client if event.client is not None else server
+            target.send_file_download("camtraj_recipe.json", content)
+
+        def _apply_recipe_data(data) -> None:
+            segments, box_motions = recipe_from_dict(data)
+            if not segments:
+                raise ValueError("Recipe has no segments.")
+            state["segments"] = segments
+            state["box_motions"] = box_motions
+            state["selected"] = 0
+            recipe_status.content = f"Loaded {len(segments)} segment(s)."
+            rebuild_timeline()
+            rebuild_segment_param_ui()
+            rebuild_and_redraw()
+
+        @example_recipe_button.on_click
+        def _(_) -> None:
+            try:
+                _apply_recipe_data(json.loads(EXAMPLE_RECIPE_PATH.read_text()))
+            except Exception as e:
+                recipe_status.content = f"**Load failed:** {e}"
+
+        @load_recipe_button.on_upload
+        def _(_) -> None:
+            try:
+                _apply_recipe_data(json.loads(load_recipe_button.value.content.decode("utf-8")))
+            except Exception as e:
+                recipe_status.content = f"**Load failed:** {e}"
+
+    # --- Export: camera + box, as two separate .npz files --------------------
+    # The camera trajectory is converted (via `camtraj.conventions.convert_pose`)
+    # from the app's canonical OpenGL/c2w convention into whichever convention
+    # is picked -- no new sign-flip code, just the same generic conversion used
+    # internally for viser's frustums. Box positions are always plain
+    # world-space coordinates (not a camera pose), so they're exported as-is
+    # regardless of the selected camera convention.
+
+    with server.gui.add_folder("Export"):
+        convention_dropdown = server.gui.add_dropdown(
+            "Convention", options=list(KNOWN_CONVENTIONS.keys()), initial_value=OPENGL.name
+        )
+        convention_info = server.gui.add_markdown(KNOWN_CONVENTIONS[OPENGL.name].description)
+
+        @convention_dropdown.on_update
+        def _(_) -> None:
+            convention_info.content = KNOWN_CONVENTIONS[convention_dropdown.value].description
+
+        export_button = server.gui.add_button("Download trajectory (.npz)", icon=viser.Icon.DOWNLOAD)
+
+        @export_button.on_click
+        def _(event: viser.GuiEvent) -> None:
+            trajectory = state["trajectory"]
+            target_convention = KNOWN_CONVENTIONS[convention_dropdown.value]
+            cam_positions, cam_rotations = convert_pose(
+                trajectory.positions, trajectory.rotations, OPENGL, target_convention
+            )
+
+            camera_buf = io.BytesIO()
+            np.savez(
+                camera_buf,
+                times=trajectory.times,
+                positions=cam_positions,
+                quaternions_xyzw=cam_rotations.as_quat(),
+                convention=target_convention.name,
+            )
+            box_buf = io.BytesIO()
+            np.savez(box_buf, times=trajectory.times, positions=trajectory.box_positions)
+
+            target = event.client if event.client is not None else server
+            target.send_file_download(f"camtraj_camera_{target_convention.name}.npz", camera_buf.getvalue())
+            target.send_file_download("camtraj_box.npz", box_buf.getvalue())
 
     set_playing(False)  # establish consistent initial visibility
 

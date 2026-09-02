@@ -48,6 +48,8 @@ import { WebsocketMessageProducer } from "./WebsocketInterface";
 import { Titlebar } from "./Titlebar";
 import { ViserModal } from "./Modal";
 import { CommandPalette } from "./CommandPalette";
+import { SegmentTimeline } from "./SegmentTimeline";
+import { KeyframeTimeline } from "./KeyframeTimeline";
 import { useSceneTreeState } from "./SceneTreeState";
 import { useEnvironmentState } from "./EnvironmentState";
 import { useDevSettingsStore } from "./DevSettingsStore";
@@ -391,6 +393,8 @@ function ViewerContents({
         <BrowserWarning />
         <ViserModal />
         <CommandPalette />
+        <SegmentTimeline />
+        <KeyframeTimeline />
         <AppLayout
           darkMode={darkMode}
           controlLayout={controlLayout}

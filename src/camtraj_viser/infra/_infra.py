@@ -576,7 +576,7 @@ class WebsockServer(WebsockMessageHandler):
 
                 nonlocal total_connections
                 total_connections += 1
-
+            '''
             # Version check to make sure Viser server/client match.
             import viser
 
@@ -596,7 +596,7 @@ class WebsockServer(WebsockMessageHandler):
                     f"Version mismatch. Client: {client_version_str}, Server: {viser.__version__}",
                 )
                 return  # Exit handler to prevent further processing.
-
+            '''
             client_state = _ClientHandleState(
                 AsyncMessageBuffer(event_loop, persistent_messages=False),
                 event_loop,

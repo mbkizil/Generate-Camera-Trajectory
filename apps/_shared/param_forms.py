@@ -47,62 +47,49 @@ def add_param_sliders(
     return handles
 
 
-def add_optional_groups(
+def add_groups(
     server: viser.ViserServer,
     segment_obj,
     handles: list,
-    get_current: Callable[[str], Any | None],
-    on_replace: Callable[[str, Any | None], None],
-) -> list:
-    """For each `optional_group()` field of `segment_obj`: appends a checkbox
-    to `handles`, and (if enabled) that group's own `param()`/`enum_param()`
-    widgets directly under it -- mutating the caller's own `handles` list in
-    place (like `rebuild_and_redraw`-driven code elsewhere in the app), so its
-    usual `for h in handles: h.remove()` teardown stays correct even across a
-    later checkbox toggle. `get_current(name)` fetches the field's live value
-    (a group instance or None); `on_replace(name, value)` writes a new one
-    back and should trigger whatever re-render the caller needs. Returns the
-    list of checkbox handles created (one per group), so a caller that adds
-    more dynamic sections *before* this call can bound its own teardown by
-    "up to the first of these checkboxes" instead of "to the end of `handles`".
-
-    Call this **last**, after any other dynamic sections in the same handles
-    list (e.g. box motion) -- each group's own nested widgets are torn down as
-    "everything after this group's checkbox," which is only safe when nothing
-    else follows it in `handles`.
+    get_current: Callable[[str], Any],
+    on_replace: Callable[[str, Any], None],
+    rebuild: Callable[[], None],
+) -> None:
+    """For each `group()` field of `segment_obj`: a folder (collapsed by
+    default) containing that field's own `param()`/`enum_param()` widgets,
+    plus a "Reset ... to defaults" button -- no on/off checkbox, since the
+    field is always present (a zero-valued group instance already means "no
+    effect," the same convention `BoxMotion` uses). Every created handle is
+    appended to the caller's own `handles` list, like the rest of this
+    module's builders. `get_current(name)` fetches the field's live value;
+    `on_replace(name, value)` writes a new one back. `rebuild()` is called
+    after a reset so the caller can redraw its whole form with fresh slider
+    values (mirrors how a segment's own "Reset to defaults" button works) --
+    unlike the old checkbox-driven version, there's no positional teardown
+    assumption here, so multiple groups per segment are fine.
     """
-    checkboxes: list = []
     for spec in get_group_specs(segment_obj):
-        checkbox = server.gui.add_checkbox(spec.label, initial_value=get_current(spec.name) is not None)
-        handles.append(checkbox)
-        checkboxes.append(checkbox)
+        folder = server.gui.add_folder(spec.label, expand_by_default=False)
+        handles.append(folder)
+        with folder:
+            group_value = get_current(spec.name)
 
-        def rebuild_nested(spec=spec, checkbox=checkbox) -> None:
-            start = handles.index(checkbox) + 1
-            for h in handles[start:]:
-                h.remove()
-            del handles[start:]
-            if not checkbox.value:
-                return
-            group = get_current(spec.name) or spec.group_cls()
-
-            def on_field_change(field_name: str, value) -> None:
-                current = get_current(spec.name) or spec.group_cls()
+            def on_field_change(field_name: str, value, spec=spec) -> None:
+                current = get_current(spec.name)
                 on_replace(spec.name, dataclasses.replace(current, **{field_name: value}))
 
-            sliders = add_param_sliders(server, group, on_field_change)
+            sliders = add_param_sliders(server, group_value, on_field_change)
             handles.extend(sliders.values())
-            dropdowns = add_enum_dropdowns(server, group, on_field_change)
+            dropdowns = add_enum_dropdowns(server, group_value, on_field_change)
             handles.extend(dropdowns.values())
 
-        @checkbox.on_update
-        def _(_, spec=spec, rebuild_nested=rebuild_nested) -> None:
-            on_replace(spec.name, spec.group_cls() if checkbox.value else None)
-            rebuild_nested()
+            reset_button = server.gui.add_button(f"Reset {spec.label.lower()} to defaults", icon=viser.Icon.RESTORE)
+            handles.append(reset_button)
 
-        rebuild_nested()
-
-    return checkboxes
+            @reset_button.on_click
+            def _(_, spec=spec) -> None:
+                on_replace(spec.name, spec.group_cls())
+                rebuild()
 
 
 def add_enum_dropdowns(
