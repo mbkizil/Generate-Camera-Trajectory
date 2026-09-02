@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">CamTraj</h1>
+  <h1 align="center">Generate Camera Trajectory</h1>
   <p align="center">
     <strong>Generate and visualize camera trajectories</strong>
     <br>
@@ -10,16 +10,23 @@
 <p align="center">
   <img src="outputs/main.png" width="32%" alt="A handcrafted multi-segment shot in the trajectory designer">
   <img src="outputs/var1.png" width="32%" alt="A randomized variation of the same shot">
-  <img src="outputs/var2.png" width="32%" alt="Another randomized variation of the same shot">
+  <img src="outputs/var2.png" width="32%" alt="Another randomized variation of the same shot"><br>
+  <img src="outputs/auteur.png" width="60%" alt="Human-centric trajectory">
 </p>
 
 ---
 
+## Demo Video
+
+<p align="center">
+  <video src="outputs/camtraj.mp4" width="85%" controls></video>
+</p>
+
 ## To-do
 
-
-[] SOMA visualizations and <a href="https://cyberiada.github.io/Auteur/">Auteur DSL</a><br>
+[ ]  Any SOMA sequence upload<br>
 [ ] API generation<br>
+[x] [SOMA-X](https://github.com/NVlabs/SOMA-X) visualizations and <a href="https://cyberiada.github.io/Auteur/">Auteur DSL</a><br>
 [x] Batched generation with randomized structure (which/how many segments)<br>
 [x] Batched generation with given constraints<br>
 [x] Visualise camera POV<br>
@@ -28,15 +35,18 @@
 
 ## What is this?
 
-A toolkit for authoring camera (and scene-object) motion: pick a motion
+A toolkit for authoring camera (and scene-object-human) motion: pick a motion
 primitive, shape it with a handful of continuous sliders, and get a clean,
 exportable 3D trajectory — one carefully handcrafted shot, or a large batch
 of independent variations sampled under ranges *you* control.
 
-It reimplements the trajectory-generation logic behind
-[**LAMP**](https://cyberiada.github.io/LAMP/)'s language-driven motion DSL
+It reimplements the trajectory-generation logic behind CVPR'26 paper
+[**LAMP**](https://cyberiada.github.io/LAMP/)'s language-driven motion DSL and [**Auteur**](https://cyberiada.github.io/Auteur/)'s human-centric DSL
 for direct, LLM-free human use — continuous sliders instead of categorical
 tiers, purpose-built interactive apps instead of a script.
+
+> **Note:** This repository focuses on automatic camera-trajectory generation for general research purposes. For text-conditioned trajectory generation using LLMs, please refer to the original repositories: [LAMP](https://github.com/mbkizil/LAMP) · [Auteur](https://cyberiada.github.io/Auteur/).
+
 
 ## Use cases
 
@@ -66,8 +76,7 @@ tiers, purpose-built interactive apps instead of a script.
   JSON; finished trajectories export as `.npz` (camera + object, separately)
   in your choice of pose convention (OpenGL, Blender, OpenCV, COLMAP).
 - **Agent-friendly.** Core math and logic are already implemented, tested,
-  and documented (`CLAUDE.md`) — new output formats, constraints, or motion
-  primitives are a well-scoped extension for a coding agent, not a
+  and documented (`user-agent.md`) — new output formats, constraints, or automated batch inference are a well-scoped extension for a coding agent, not a
   from-scratch effort.
 
 ## Quick start
@@ -75,6 +84,8 @@ tiers, purpose-built interactive apps instead of a script.
 ```bash
 micromamba activate camera          # or any Python 3.10+ environment
 pip install -e ".[dev,viz]"
+
+## pip install -e ".[auteur]" # Additional SOMA packages for Auteur trajectories. auteur_designer.py will download SOMA-X model on the first run.
 
 # Run the test suite (fast -- pure geometric invariants, no server)
 python -m pytest tests/ -q
@@ -92,9 +103,9 @@ python -m apps.structure_batch_generator
 Each app prints a local URL and, by default, a public share link — open
 either in a browser to start.
 
-## Three ways to work
+## Two ways to work
 
-### 🎯 Single-trajectory designer (`apps.trajectory_designer`)
+### 🎯 Single-trajectory designers (`apps.trajectory_designer` and `apps.auteur_designer`)
 
 Handcraft one shot with immediate visual feedback: chain segments of
 different motion primitives, tune every parameter live, scrub/play the
@@ -120,46 +131,26 @@ generate N independent, reproducible trajectories in one click.
 - Deterministic given a seed; downloads one `.zip` with a `manifest.json`
   (exactly what each draw sampled) plus a camera/object `.npz` pair per draw
 
-### 🧩 Structure batch generator (`apps.structure_batch_generator`)
-
-The complement to the batch generator above: values are fixed, structure
-varies. Load one or more recipes into a shared pool of ready-made segments,
-then generate sequences that chain a random number of them, in random order
-— each segment used exactly as-is.
-
-- Every loaded recipe's segments become candidate "blocks" in one pool
-- Uncheck a block to exclude it from sampling without losing it
-- A sequence-length range controls how many blocks each draw chains
-- Same preview / seed / `.zip` + manifest workflow as the batch generator
+- 🧩 Structure batch generator (`apps.structure_batch_generator`): The complement to the batch generator above: values are fixed, structure
+varies. 
 
 ## Motion primitives
 
-`free_form`, `orbit`, `tail_track`, `rotation_track` — four handcrafted
-primitives grounded in cinematography literature, not reverse-engineered
-from arbitrary curves. See the To-do above for what's coming next.
+LAMP: `free_form`, `orbit`, `tail_track`, `rotation_track` — four handcrafted
+primitives grounded in cinematography literature. 
 
-## Repository layout
+Auteur: `orientation`,`scale`,`dutch_angle`,`camera_level`,`lookat_level`, and `framing`. 6 axes corresponding to 6-DoF following the representation by Auteur paper.
 
-```
-src/camtraj/          core library -- numpy + scipy only, no UI dependency
-  segments/             the motion primitives (free_form, orbit, tail, rotation_track)
-  conventions.py        pose-convention framework + conversion
-  recipe.py             save/load a trajectory design as JSON
-  batch.py              randomized-values sampling around a fixed recipe
-  structure_batch.py    randomized-structure sampling from a pool of fixed segments
-src/camtraj_viser/    vendored, patched viser frontend (Apache-2.0; see CAMTRAJ_PATCH.md)
-apps/                 the three interactive apps described above
-scripts/              matplotlib sanity checks -- no server needed
-tests/                geometric invariant tests
-```
+
+
 
 ## Citation
 
-If you use this in your work, please consider citing LAMP, whose DSL this
+If you use this in your work, please consider citing LAMP and Auteur, whose DSL's this
 project's motion vocabulary is drawn from:
 
 ```bibtex
-@misc{kizil2025lamplanguageassistedmotionplanning,
+@misc{kizil2025lamp,
     title={LAMP: Language-Assisted Motion Planning for Controllable Video Generation},
     author={Muhammed Burak Kizil and Enes Sanli and Niloy J. Mitra and Erkut Erdem and Aykut Erdem and Duygu Ceylan},
     year={2025},
@@ -167,5 +158,17 @@ project's motion vocabulary is drawn from:
     archivePrefix={arXiv},
     primaryClass={cs.CV},
     url={https://arxiv.org/abs/2512.03619},
+}
+```
+
+```bibtex
+@misc{kizil2026auteur,
+      title={Auteur: Language-Driven Cinematographic Framing for Human-Centric Video Generation}, 
+      author={Muhammed Burak Kizil and Enes Sanli and Niloy J. Mitra and Xuelin Chen and Erkut Erdem and Aykut Erdem and Duygu Ceylan},
+      year={2026},
+      eprint={2606.01900},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2606.01900}, 
 }
 ```

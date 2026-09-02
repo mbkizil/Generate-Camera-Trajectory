@@ -49,6 +49,7 @@ src/camtraj_viser/    vendored, patched viser frontend -- the UI framework the
 apps/                 the three interactive apps -- this is where most
                        requested changes belong
   trajectory_designer.py        handcraft one trajectory
+  auteur_designer.py            handcraft Auteur trajectory
   batch_generator.py            randomize parameter values around a fixed design
   structure_batch_generator.py  randomize which/how many segments, values fixed
   _shared/                      reusable UI-building helpers (sliders, scene setup)
@@ -60,7 +61,7 @@ outputs/              gitignored scratch space, except the three README images
 
 ## Practical notes
 
-- Environment: micromamba env `camera`, Python 3.10+. `pip install -e ".[dev,viz]"`.
+- Environment: micromamba env `camera`, Python 3.10+. `pip install -e ".[dev,viz]"`. If working with Auteur, then also `pip install -e ".[auteur]"`
 - Run an app: `python -m apps.trajectory_designer` (or `batch_generator` /
   `structure_batch_generator` — each binds its own port, can run together).
 - Run tests: `python -m pytest tests/ -q`.
