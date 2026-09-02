@@ -28,13 +28,13 @@ https://github.com/user-attachments/assets/c0bb795b-5eed-4ffd-9170-41f9f4ecc998
 
 ## To-do
 
-[ ]  Any SOMA sequence upload<br>
-[ ] API generation<br>
-[x] [SOMA-X](https://github.com/NVlabs/SOMA-X) visualizations and <a href="https://cyberiada.github.io/Auteur/">Auteur DSL</a><br>
-[x] Batched generation with randomized structure (which/how many segments)<br>
-[x] Batched generation with given constraints<br>
-[x] Visualise camera POV<br>
-[x] Generate and visualise fine-grained camera trajectory
+- [ ]  Any SOMA sequence upload<br>
+- [ ] API generation<br>
+- [x] [SOMA-X](https://github.com/NVlabs/SOMA-X) visualizations and <a href="https://cyberiada.github.io/Auteur/">Auteur DSL</a><br>
+- [x] Batched generation with randomized structure (which/how many segments)<br>
+- [x] Batched generation with given constraints<br>
+- [x] Visualise camera POV<br>
+- [x] Generate and visualise fine-grained camera trajectory
 
 
 ## What is this?
