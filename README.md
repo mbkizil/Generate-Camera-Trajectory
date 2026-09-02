@@ -1,3 +1,8 @@
+
+
+
+
+
 <p align="center">
   <h1 align="center">Generate Camera Trajectory</h1>
   <p align="center">
@@ -18,9 +23,8 @@
 
 ## Demo Video
 
-<p align="center">
-  <video src="outputs/camtraj.mp4" width="85%" controls></video>
-</p>
+https://github.com/user-attachments/assets/c0bb795b-5eed-4ffd-9170-41f9f4ecc998
+
 
 ## To-do
 
